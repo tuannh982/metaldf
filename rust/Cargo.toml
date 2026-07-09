@@ -1,0 +1,18 @@
+[package]
+name = "metaldf-engine"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "metaldf_engine"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+pyo3 = { version = "0.22" }
+numpy = "0.22"
+metal = "0.33"
+lazy_static = "1.4"
+
+[features]
+extension-module = ["pyo3/extension-module"]
