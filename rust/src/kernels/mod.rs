@@ -96,17 +96,22 @@ pub fn tuning() -> &'static GpuTuning {
     &GPU_TUNING
 }
 
+pub mod elementwise;
 pub mod reductions;
 pub mod sort;
 pub mod groupby;
 pub mod strings;
+pub mod expression;
+pub mod codegen;
 
 include!(concat!(env!("OUT_DIR"), "/common_preamble_src.rs"));
+include!(concat!(env!("OUT_DIR"), "/elementwise_metal_src.rs"));
 include!(concat!(env!("OUT_DIR"), "/reduction_metal_src.rs"));
 include!(concat!(env!("OUT_DIR"), "/sort_metal_src.rs"));
 include!(concat!(env!("OUT_DIR"), "/groupby_metal_src.rs"));
 include!(concat!(env!("OUT_DIR"), "/strings_metal_src.rs"));
 include!(concat!(env!("OUT_DIR"), "/test_debug_metal_src.rs"));
+include!(concat!(env!("OUT_DIR"), "/expression_metal_src.rs"));
 
 lazy_static::lazy_static! {
     static ref PIPELINE_CACHE: Mutex<HashMap<String, ComputePipelineState>> =
@@ -152,6 +157,10 @@ fn load_library(device: &Device, name: &str, source: &str) -> Result<Library, St
         .map_err(|e| format!("Failed to compile {name} MSL: {:?}", e))
 }
 
+pub fn load_elementwise_library(device: &Device) -> Result<Library, String> {
+    load_library(device, "elementwise", ELEMENTWISE_METAL_SRC)
+}
+
 pub fn load_reductions_library(device: &Device) -> Result<Library, String> {
     load_library(device, "reductions", REDUCTION_METAL_SRC)
 }
@@ -166,6 +175,10 @@ pub fn load_groupby_library(device: &Device) -> Result<Library, String> {
 
 pub fn load_strings_library(device: &Device) -> Result<Library, String> {
     load_library(device, "strings", STRINGS_METAL_SRC)
+}
+
+pub fn load_expression_library(device: &Device) -> Result<Library, String> {
+    load_library(device, "expression", EXPRESSION_METAL_SRC)
 }
 
 pub fn get_pipeline_state(

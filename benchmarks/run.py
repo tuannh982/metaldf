@@ -52,7 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from data import make_numeric_array, make_numeric_keys, make_string_list  # noqa: E402, I001
 from metaldf._wrappers import ProxyDataFrame, ProxySeries  # noqa: E402
 
-N = 5_000_000
+N = 10_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +156,13 @@ def verify_argsort(original: np.ndarray) -> Callable[[Any, Any], None]:
     return _verify
 
 
-def verify_groupby(metal: Any, pandas: pd.Series, rtol: float = 1e-2) -> None:
-    """Verify a groupby result, ignoring key order (Metal doesn't preserve pandas' key order)."""
+def verify_groupby(metal: Any, pandas: pd.Series, rtol: float = 5e-2) -> None:
+    """Verify a groupby result, ignoring key order (Metal doesn't preserve pandas' key order).
+
+    Tolerance is generous (5%) because float32 groupby accumulation order differs
+    between GPU (hash/sort-based atomic adds) and CPU (sequential), and the error
+    grows with element count (~100K elements per group at 10M/100 keys).
+    """
     metal_s = _unwrap(metal).sort_index()
     pandas_s = pandas.sort_index()
     pd.testing.assert_series_equal(
@@ -359,6 +364,342 @@ def bench_strings() -> list[dict]:
     return results
 
 
+def bench_elementwise() -> list[dict]:
+    """Benchmark element-wise ops: single binary and chained unfused."""
+    print("\n=== Element-wise Operations (5M elements) ===")
+    results = []
+    a_arr = make_numeric_array(N, np.float32, seed=42)
+    b_arr = make_numeric_array(N, np.float32, seed=43)
+    c_arr = make_numeric_array(N, np.float32, seed=44)
+    d_arr = make_numeric_array(N, np.float32, seed=45)
+    a_s, b_s = pd.Series(a_arr), pd.Series(b_arr)
+    c_s, d_s = pd.Series(c_arr), pd.Series(d_arr)
+    pa = ProxySeries(_pandas_obj=a_s)
+    pb = ProxySeries(_pandas_obj=b_s)
+    pc = ProxySeries(_pandas_obj=c_s)
+    pd_ = ProxySeries(_pandas_obj=d_s)
+    for name, mfn, pfn in [
+        ("add float32", lambda: pa + pb, lambda: a_s + b_s),
+        ("sub float32", lambda: pa - pb, lambda: a_s - b_s),
+        ("mul float32", lambda: pa * pb, lambda: a_s * b_s),
+    ]:
+        r = bench_verified(name, mfn, pfn, verify_series)
+        r.update({"category": "elementwise", "op": name, "dtype": "float32"})
+        results.append(r)
+    r = bench_verified(
+        "chained (a+b)*c-d float32",
+        lambda: (pa + pb) * pc - pd_,
+        lambda: (a_s + b_s) * c_s - d_s,
+        verify_series,
+    )
+    r.update({"category": "elementwise_chain", "op": "(a+b)*c-d", "dtype": "float32"})
+    results.append(r)
+    return results
+
+
+def bench_fused() -> list[dict]:
+    """Compare fused vs unfused for chained expressions."""
+    print("\n=== Fused Expression Evaluation (5M float32) ===")
+    results = []
+    import metaldf_engine
+
+    a_arr = make_numeric_array(N, np.float32, seed=42)
+    b_arr = make_numeric_array(N, np.float32, seed=43)
+    c_arr = make_numeric_array(N, np.float32, seed=44)
+    d_arr = make_numeric_array(N, np.float32, seed=45)
+    ma = metaldf_engine.MetalSeries.from_numpy(a_arr)
+    mb = metaldf_engine.MetalSeries.from_numpy(b_arr)
+    mc = metaldf_engine.MetalSeries.from_numpy(c_arr)
+    md = metaldf_engine.MetalSeries.from_numpy(d_arr)
+    # (col0 + col1) * col2 - col3
+    program = bytes([0, 1, 16, 2, 18, 3, 17])
+
+    pandas_a, pandas_b = pd.Series(a_arr), pd.Series(b_arr)
+    pandas_c, pandas_d = pd.Series(c_arr), pd.Series(d_arr)
+
+    def verify_fused(metal, pandas):
+        np.testing.assert_allclose(metal.to_numpy(), pandas.to_numpy(), rtol=1e-4)
+
+    # Direct fused kernel
+    r = bench_verified(
+        "fused (a+b)*c-d direct",
+        lambda: metaldf_engine.eval_expression(program, [ma, mb, mc, md], N),
+        lambda: (pandas_a + pandas_b) * pandas_c - pandas_d,
+        verify_fused,
+    )
+    r.update({"category": "fused", "op": "(a+b)*c-d", "dtype": "float32"})
+    results.append(r)
+
+    # Unfused (3 separate kernel launches)
+    r = bench_verified(
+        "unfused (a+b)*c-d direct",
+        lambda: metaldf_engine.metal_binary_op(
+            "sub",
+            metaldf_engine.metal_binary_op(
+                "mul",
+                metaldf_engine.metal_binary_op("add", ma, mb),
+                mc,
+            ),
+            md,
+        ),
+        lambda: (pandas_a + pandas_b) * pandas_c - pandas_d,
+        verify_fused,
+    )
+    r.update({"category": "unfused", "op": "(a+b)*c-d", "dtype": "float32"})
+    results.append(r)
+
+    # End-to-end via DeferredSeries proxy
+    pa = ProxySeries(_pandas_obj=pandas_a)
+    pb = ProxySeries(_pandas_obj=pandas_b)
+    pc = ProxySeries(_pandas_obj=pandas_c)
+    pd_ = ProxySeries(_pandas_obj=pandas_d)
+
+    def deferred_chain():
+        return ((pa + pb) * pc - pd_).to_pandas()
+
+    r = bench_verified(
+        "deferred (a+b)*c-d e2e",
+        deferred_chain,
+        lambda: (pandas_a + pandas_b) * pandas_c - pandas_d,
+        verify_series,
+    )
+    r.update({"category": "fused_e2e", "op": "(a+b)*c-d", "dtype": "float32"})
+    results.append(r)
+
+    # Size sweep
+    for sz in [1_000_000, 5_000_000, 10_000_000, 20_000_000]:
+        a = np.random.default_rng(42).standard_normal(sz).astype(np.float32)
+        b = np.random.default_rng(43).standard_normal(sz).astype(np.float32)
+        c = np.random.default_rng(44).standard_normal(sz).astype(np.float32)
+        d = np.random.default_rng(45).standard_normal(sz).astype(np.float32)
+        ma2 = metaldf_engine.MetalSeries.from_numpy(a)
+        mb2 = metaldf_engine.MetalSeries.from_numpy(b)
+        mc2 = metaldf_engine.MetalSeries.from_numpy(c)
+        md2 = metaldf_engine.MetalSeries.from_numpy(d)
+        pa2, pb2, pc2, pd2 = pd.Series(a), pd.Series(b), pd.Series(c), pd.Series(d)
+        r = bench_verified(
+            f"fused (a+b)*c-d {sz//1000}K",
+            lambda ma2=ma2, mb2=mb2, mc2=mc2, md2=md2, sz=sz: metaldf_engine.eval_expression(program, [ma2, mb2, mc2, md2], sz),
+            lambda pa2=pa2, pb2=pb2, pc2=pc2, pd2=pd2: (pa2 + pb2) * pc2 - pd2,
+            verify_fused,
+        )
+        r.update({"category": "fused_sweep", "op": f"(a+b)*c-d_{sz}", "dtype": "float32"})
+        results.append(r)
+        del a, b, c, d, ma2, mb2, mc2, md2, pa2, pb2, pc2, pd2
+        gc.collect()
+
+    return results
+
+
+def bench_codegen() -> list[dict]:
+    """Compare interpreter vs codegen for expression evaluation."""
+    print("\n=== Codegen vs Interpreter (5M float32) ===")
+    results = []
+    import metaldf_engine
+
+    a_arr = make_numeric_array(N, np.float32, seed=42)
+    b_arr = make_numeric_array(N, np.float32, seed=43)
+    c_arr = make_numeric_array(N, np.float32, seed=44)
+    d_arr = make_numeric_array(N, np.float32, seed=45)
+    ma = metaldf_engine.MetalSeries.from_numpy(a_arr)
+    mb = metaldf_engine.MetalSeries.from_numpy(b_arr)
+    mc = metaldf_engine.MetalSeries.from_numpy(c_arr)
+    md = metaldf_engine.MetalSeries.from_numpy(d_arr)
+    program = bytes([0, 1, 16, 2, 18, 3, 17])  # (col0+col1)*col2-col3
+
+    pandas_a = pd.Series(a_arr)
+    pandas_b = pd.Series(b_arr)
+    pandas_c = pd.Series(c_arr)
+    pandas_d = pd.Series(d_arr)
+
+    def verify_cg(metal, pandas):
+        np.testing.assert_allclose(metal.to_numpy(), pandas.to_numpy(), rtol=1e-4)
+
+    # Warm up codegen cache
+    metaldf_engine.eval_expression_codegen(program, [ma, mb, mc, md], N)
+
+    r = bench_verified(
+        "interpreter (a+b)*c-d",
+        lambda: metaldf_engine.eval_expression(program, [ma, mb, mc, md], N),
+        lambda: (pandas_a + pandas_b) * pandas_c - pandas_d,
+        verify_cg,
+    )
+    r.update({"category": "codegen", "op": "interpreter", "dtype": "float32"})
+    results.append(r)
+
+    r = bench_verified(
+        "codegen cached (a+b)*c-d",
+        lambda: metaldf_engine.eval_expression_codegen(program, [ma, mb, mc, md], N),
+        lambda: (pandas_a + pandas_b) * pandas_c - pandas_d,
+        verify_cg,
+    )
+    r.update({"category": "codegen", "op": "codegen_cached", "dtype": "float32"})
+    results.append(r)
+
+    # Compilation time measurement
+    import time
+    for n_ops, prog in [
+        (1, bytes([0, 1, 16])),  # a+b
+        (3, bytes([0, 1, 16, 2, 18, 3, 17])),  # (a+b)*c-d
+        (5, bytes([0, 1, 16, 2, 18, 3, 17, 4, 16])),  # ((a+b)*c-d)+e
+    ]:
+        # Force cache miss by modifying program slightly
+        test_prog = bytes(list(prog) + [32])  # append ABS to make unique
+        t0 = time.perf_counter()
+        metaldf_engine.eval_expression_codegen(test_prog, [ma, mb, mc, md, ma], N)
+        compile_ms = (time.perf_counter() - t0) * 1000
+        print(f"  codegen compile time ({n_ops} ops): {compile_ms:.1f}ms")
+
+    return results
+
+
+def bench_fused_reduce() -> list[dict]:
+    """Compare fused expression-reduce vs separate codegen+reduce."""
+    print("\n=== Fused Expression-Reduce (5M float32) ===")
+    results = []
+    import metaldf_engine
+
+    a_arr = make_numeric_array(N, np.float32, seed=42)
+    b_arr = make_numeric_array(N, np.float32, seed=43)
+    c_arr = make_numeric_array(N, np.float32, seed=44)
+    d_arr = make_numeric_array(N, np.float32, seed=45)
+    ma = metaldf_engine.MetalSeries.from_numpy(a_arr)
+    mb = metaldf_engine.MetalSeries.from_numpy(b_arr)
+    mc = metaldf_engine.MetalSeries.from_numpy(c_arr)
+    md = metaldf_engine.MetalSeries.from_numpy(d_arr)
+    program = bytes([0, 1, 16, 2, 18, 3, 17])  # (col0+col1)*col2-col3
+
+    pandas_a, pandas_b = pd.Series(a_arr), pd.Series(b_arr)
+    pandas_c, pandas_d = pd.Series(c_arr), pd.Series(d_arr)
+
+    def verify_reduce(metal, pandas):
+        assert abs(float(metal) - float(pandas)) / (abs(float(pandas)) + 1e-6) < 0.01
+
+    # Fused: one kernel for expr+reduce
+    r = bench_verified(
+        "fused sum((a+b)*c-d)",
+        lambda: metaldf_engine.eval_expression_reduce("sum", program, [ma, mb, mc, md], N),
+        lambda: float(((pandas_a + pandas_b) * pandas_c - pandas_d).sum()),
+        verify_reduce,
+    )
+    r.update({"category": "fused_reduce", "op": "sum((a+b)*c-d)", "dtype": "float32"})
+    results.append(r)
+
+    # Separate: codegen then reduce
+    r = bench_verified(
+        "separate codegen+reduce sum((a+b)*c-d)",
+        lambda: float(metaldf_engine.eval_expression_codegen(program, [ma, mb, mc, md], N).to_numpy().sum()),
+        lambda: float(((pandas_a + pandas_b) * pandas_c - pandas_d).sum()),
+        verify_reduce,
+    )
+    r.update({"category": "separate_reduce", "op": "sum((a+b)*c-d)", "dtype": "float32"})
+    results.append(r)
+
+    # End-to-end via DeferredSeries
+    pa = ProxySeries(_pandas_obj=pandas_a)
+    pb = ProxySeries(_pandas_obj=pandas_b)
+    pc = ProxySeries(_pandas_obj=pandas_c)
+    pd_ = ProxySeries(_pandas_obj=pandas_d)
+
+    r = bench_verified(
+        "deferred sum((a+b)*c-d) e2e",
+        lambda: float(((pa + pb) * pc - pd_).sum()),
+        lambda: float(((pandas_a + pandas_b) * pandas_c - pandas_d).sum()),
+        verify_reduce,
+    )
+    r.update({"category": "fused_reduce_e2e", "op": "sum((a+b)*c-d)", "dtype": "float32"})
+    results.append(r)
+
+    return results
+
+
+def bench_long_chains() -> list[dict]:
+    """Benchmark longer expression chains and deferred sort."""
+    print("\n=== Long Chain Benchmarks (5M float32) ===")
+    results = []
+    import metaldf_engine
+
+    rng = np.random.default_rng(42)
+    arrays = [rng.standard_normal(N).astype(np.float32) for _ in range(8)]
+    metal_series = [metaldf_engine.MetalSeries.from_numpy(a) for a in arrays]
+    pandas_series = [pd.Series(a) for a in arrays]
+    proxy_series = [ProxySeries(_pandas_obj=s) for s in pandas_series]
+
+    def verify_reduce(metal, pandas):
+        assert abs(float(metal) - float(pandas)) / (abs(float(pandas)) + 1e-6) < 0.01
+
+    def verify_sort(metal, pandas):
+        m = metal.to_numpy() if hasattr(metal, 'to_numpy') else np.asarray(metal)
+        p = pandas.to_numpy() if hasattr(pandas, 'to_numpy') else np.asarray(pandas)
+        np.testing.assert_allclose(m, p, rtol=1e-4)
+
+    def verify_codegen(metal, pandas):
+        # atol handles near-zero results (catastrophic cancellation in
+        # subtraction-heavy chains): GPU vs CPU float32 rounding differs at
+        # the ~1e-7 absolute level, which blows up under pure rtol when the
+        # true value is close to zero.
+        np.testing.assert_allclose(metal.to_numpy(), pandas.to_numpy(), rtol=1e-4, atol=1e-4)
+
+    # 5-op chain: a + b * c - d / e  → program: col0 col1 col2 MUL ADD col3 col4 DIV SUB
+    prog_5 = bytes([0, 1, 2, 18, 16, 3, 4, 19, 17])
+    pandas_5 = lambda: pandas_series[0] + pandas_series[1] * pandas_series[2] - pandas_series[3] / pandas_series[4]
+
+    r = bench_verified(
+        "5-op fused codegen",
+        lambda: metaldf_engine.eval_expression_codegen(prog_5, metal_series[:5], N),
+        pandas_5,
+        verify_codegen,
+    )
+    r.update({"category": "long_chain", "op": "5op_codegen", "dtype": "float32"})
+    results.append(r)
+
+    # 5-op fused reduce: sum(a + b * c - d / e)
+    r = bench_verified(
+        "sum(5-op) fused",
+        lambda: metaldf_engine.eval_expression_reduce("sum", prog_5, metal_series[:5], N),
+        lambda: float(pandas_5().sum()),
+        verify_reduce,
+    )
+    r.update({"category": "long_chain_reduce", "op": "sum(5op)", "dtype": "float32"})
+    results.append(r)
+
+    # 8-op chain: a + b * c - d / e + f * g - h
+    prog_8 = bytes([0, 1, 2, 18, 16, 3, 4, 19, 17, 5, 6, 18, 16, 7, 17])
+    pandas_8 = lambda: pandas_series[0] + pandas_series[1] * pandas_series[2] - pandas_series[3] / pandas_series[4] + pandas_series[5] * pandas_series[6] - pandas_series[7]
+
+    r = bench_verified(
+        "8-op fused codegen",
+        lambda: metaldf_engine.eval_expression_codegen(prog_8, metal_series, N),
+        pandas_8,
+        verify_codegen,
+    )
+    r.update({"category": "long_chain", "op": "8op_codegen", "dtype": "float32"})
+    results.append(r)
+
+    # 8-op fused reduce: sum(8-op chain)
+    r = bench_verified(
+        "sum(8-op) fused",
+        lambda: metaldf_engine.eval_expression_reduce("sum", prog_8, metal_series, N),
+        lambda: float(pandas_8().sum()),
+        verify_reduce,
+    )
+    r.update({"category": "long_chain_reduce", "op": "sum(8op)", "dtype": "float32"})
+    results.append(r)
+
+    # Deferred sort: (a + b).sort_values()
+    pa, pb = proxy_series[0], proxy_series[1]
+    r = bench_verified(
+        "deferred (a+b).sort_values()",
+        lambda: (pa + pb).sort_values(),
+        lambda: (pandas_series[0] + pandas_series[1]).sort_values(),
+        verify_sort,
+    )
+    r.update({"category": "deferred_sort", "op": "(a+b).sort()", "dtype": "float32"})
+    results.append(r)
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -425,6 +766,16 @@ def main() -> None:
     all_results.extend(bench_groupby_numeric())
     gc.collect()
     all_results.extend(bench_strings())
+    gc.collect()
+    all_results.extend(bench_elementwise())
+    gc.collect()
+    all_results.extend(bench_fused())
+    gc.collect()
+    all_results.extend(bench_codegen())
+    gc.collect()
+    all_results.extend(bench_fused_reduce())
+    gc.collect()
+    all_results.extend(bench_long_chains())
     gc.collect()
 
     print_summary(all_results)

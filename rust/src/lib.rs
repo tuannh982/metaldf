@@ -2,12 +2,15 @@ use pyo3::prelude::*;
 
 pub mod backend;
 pub mod buffer;
+pub mod column;
+pub mod column_view;
 pub mod kernels;
 pub mod series;
 
-use backend::MetalBackend;
+use backend::{BatchContext, MetalBackend};
 use series::MetalSeries;
 use kernels::{is_debug_enabled, set_debug_enabled, detect_gpu_family, tuning};
+use kernels::elementwise::{metal_binary_op, metal_binary_op_batched, metal_unary_op};
 use kernels::reductions::{metal_sum, metal_min, metal_max, metal_mean};
 use kernels::sort::{metal_sort, metal_argsort};
 use kernels::groupby::{metal_groupby_sum, metal_groupby_mean, metal_groupby_min, metal_groupby_max, metal_groupby_count};
@@ -18,6 +21,8 @@ use kernels::strings::{
     metal_string_lower, metal_string_upper, metal_string_strip, metal_string_replace,
     metal_string_sort, metal_string_groupby,
 };
+use kernels::expression::{eval_expression, eval_expression_reduce};
+use kernels::codegen::eval_expression_codegen;
 
 #[pyfunction]
 fn metal_gpu_info(py: Python) -> PyResult<PyObject> {
@@ -42,9 +47,30 @@ fn metal_gpu_info(py: Python) -> PyResult<PyObject> {
     Ok(dict.into())
 }
 
+/// Start a new batch: allocates a fresh command buffer that subsequent
+/// `metal_*_batched` calls encode dispatches into, without committing.
+/// Call `batch_commit` once all desired ops have been encoded.
+#[pyfunction]
+fn begin_batch() -> PyResult<BatchContext> {
+    MetalBackend::begin_batch()
+}
+
+/// Commit a batch's command buffer and block until the GPU finishes
+/// executing every dispatch encoded into it (via `metal_*_batched` calls).
+#[pyfunction]
+fn batch_commit(batch: &BatchContext) -> PyResult<()> {
+    batch.commit_and_wait()
+}
+
 #[pymodule]
 fn metaldf_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MetalSeries>()?;
+    m.add_class::<BatchContext>()?;
+    m.add_wrapped(wrap_pyfunction!(metal_binary_op))?;
+    m.add_wrapped(wrap_pyfunction!(metal_binary_op_batched))?;
+    m.add_wrapped(wrap_pyfunction!(begin_batch))?;
+    m.add_wrapped(wrap_pyfunction!(batch_commit))?;
+    m.add_wrapped(wrap_pyfunction!(metal_unary_op))?;
     m.add_wrapped(wrap_pyfunction!(metal_sum))?;
     m.add_wrapped(wrap_pyfunction!(metal_min))?;
     m.add_wrapped(wrap_pyfunction!(metal_max))?;
@@ -73,6 +99,9 @@ fn metaldf_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(metal_string_replace))?;
     m.add_wrapped(wrap_pyfunction!(metal_string_sort))?;
     m.add_wrapped(wrap_pyfunction!(metal_string_groupby))?;
+    m.add_wrapped(wrap_pyfunction!(eval_expression))?;
+    m.add_wrapped(wrap_pyfunction!(eval_expression_reduce))?;
+    m.add_wrapped(wrap_pyfunction!(eval_expression_codegen))?;
     m.add_wrapped(wrap_pyfunction!(metal_gpu_info))?;
 
     m.add_wrapped(wrap_pyfunction!(py_set_debug_enabled))?;

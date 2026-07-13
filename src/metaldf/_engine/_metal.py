@@ -118,6 +118,83 @@ def _dispatch_reduction(op_name: str, data: Any) -> Any:
     return rust_fn(buf)
 
 
+
+# ---------------------------------------------------------------------------
+# Elementwise binary op dtype support
+# ---------------------------------------------------------------------------
+
+# NOTE: use np.dtype(...) instances, not bare numpy scalar types -- see the
+# _SORT_DTYPES comment above for why comparing dtype instances to bare
+# numpy scalar types silently breaks set/dict membership checks.
+_ELEMENTWISE_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64)}
+
+# pandas' true division (`/` / `__truediv__`) always promotes int Series to
+# float64 (e.g. 10 / 3 == 3.333...). The Metal `div` kernel does same-dtype
+# division -- floor division for int32/int64 (see
+# tests/test_elementwise.py::TestBinaryOps::test_binary_i32, where the
+# expected value for integer "div" is `a // b`, not `a / b`). Routing an
+# int __truediv__ to Metal would therefore silently return the wrong
+# (floor-divided) integers instead of pandas' float result, so "div" is
+# restricted to float32, where Metal's division and pandas' true division
+# agree.
+_TRUEDIV_DTYPES = {np.dtype(np.float32)}
+
+
+def _dispatch_binary(op_name: str, a: Any, b: Any) -> Any:
+    """Try a Metal elementwise binary op (add/sub/mul/div), raising
+    ``MetalNotAvailable`` for any condition Metal can't -- or, for
+    integer true-division, *shouldn't* -- handle, so the caller falls back
+    to pandas.
+    """
+    if not _has_metal():
+        raise MetalNotAvailable("Metal not available")
+
+    from metaldf._wrappers import ProxySeries
+    if isinstance(a, ProxySeries) and hasattr(a, "_pandas_obj"):
+        a = a.to_pandas()
+    if isinstance(b, ProxySeries) and hasattr(b, "_pandas_obj"):
+        b = b.to_pandas()
+
+    if not hasattr(a, "dtype") or not hasattr(b, "dtype"):
+        raise MetalNotAvailable("Operands must be pandas Series or numpy arrays")
+
+    if a.dtype not in _ELEMENTWISE_DTYPES or b.dtype not in _ELEMENTWISE_DTYPES:
+        raise MetalNotAvailable(f"Unsupported dtype: {a.dtype}, {b.dtype}")
+
+    if a.dtype != b.dtype:
+        raise MetalNotAvailable(f"dtype mismatch: {a.dtype} vs {b.dtype}")
+
+    if op_name == "div" and a.dtype not in _TRUEDIV_DTYPES:
+        raise MetalNotAvailable(
+            f"True division of {a.dtype} needs float promotion; "
+            "Metal 'div' does same-dtype (floor) division for integers"
+        )
+
+    # Metal has no notion of pandas' index-alignment semantics -- it just
+    # zips positionally. Only dispatch when both operands already share the
+    # same index (the overwhelmingly common case), otherwise fall back to
+    # pandas so alignment (union index, NaN-filling on mismatches) happens.
+    a_index = getattr(a, "index", None)
+    b_index = getattr(b, "index", None)
+    if a_index is not None and b_index is not None and not a_index.equals(b_index):
+        raise MetalNotAvailable("Index mismatch requires pandas-side alignment")
+
+    arr_a = _extract_array(a)
+    arr_b = _extract_array(b)
+    buf_a = _make_series(arr_a)
+    buf_b = _make_series(arr_b)
+    result = metaldf_engine.metal_binary_op(op_name, buf_a, buf_b)
+
+    # Match pandas' name-inference rule for binary ops: if `b` is also a
+    # Series, the result keeps the name only when both sides agree (e.g.
+    # `pd.Series(..., name="x") + pd.Series(..., name="y")` -> name=None);
+    # if `b` is a scalar/array (no `name` attribute), `a`'s name passes
+    # through unchanged.
+    a_name = getattr(a, "name", None)
+    name = a_name if not hasattr(b, "name") or a_name == b.name else None
+    return pd.Series(result.to_numpy(), index=a_index, name=name)
+
+
 def _groupby_dispatch(agg_name: str, keys: Any, values: Any) -> Any:
     """Generic groupby dispatch to Metal."""
     if not _has_metal():
@@ -238,6 +315,24 @@ class MetalEngine:
     @staticmethod
     def metal_mean(data: Any) -> float:
         return _dispatch_reduction("mean", data)
+
+    # -- Elementwise binary ops ------------------------------------------
+
+    @staticmethod
+    def metal_add(a: Any, b: Any) -> Any:
+        return _dispatch_binary("add", a, b)
+
+    @staticmethod
+    def metal_sub(a: Any, b: Any) -> Any:
+        return _dispatch_binary("sub", a, b)
+
+    @staticmethod
+    def metal_mul(a: Any, b: Any) -> Any:
+        return _dispatch_binary("mul", a, b)
+
+    @staticmethod
+    def metal_div(a: Any, b: Any) -> Any:
+        return _dispatch_binary("div", a, b)
 
     # -- Sort -----------------------------------------------------------
 

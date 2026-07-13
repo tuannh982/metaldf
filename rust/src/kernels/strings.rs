@@ -9,7 +9,7 @@ use metal::{Device, MTLSize, MTLResourceOptions};
 
 use crate::backend::MetalBackend;
 use crate::buffer::{SharedBuffer, DType};
-use crate::series::{MetalSeries, SeriesData};
+use crate::series::MetalSeries;
 use crate::kernels::{load_strings_library, load_sort_library, get_pipeline_state};
 
 const THREADGROUP_SIZE: u64 = 256;
@@ -262,11 +262,7 @@ fn dispatch_string_inplace_transform(
     }
 
     let new_chars = SharedBuffer::from_metal_buffer(chars_out, total_chars, DType::Uint8);
-    Ok(MetalSeries {
-        data: SeriesData::Str { offsets: offsets.clone(), chars: new_chars },
-        len: series.len,
-        dtype: DType::Utf8,
-    })
+    Ok(MetalSeries::from_str_parts(device, offsets.clone(), new_chars, series.len))
 }
 
 #[pyfunction]
@@ -366,11 +362,7 @@ pub fn metal_string_strip(series: &MetalSeries) -> PyResult<MetalSeries> {
     let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n as usize + 1, DType::Int64);
     let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
 
-    Ok(MetalSeries {
-        data: SeriesData::Str { offsets: new_offsets, chars: new_chars },
-        len: series.len,
-        dtype: DType::Utf8,
-    })
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
 }
 
 #[pyfunction]
@@ -472,11 +464,7 @@ pub fn metal_string_replace(series: &MetalSeries, pat: &str, repl: &str) -> PyRe
     let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n as usize + 1, DType::Int64);
     let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
 
-    Ok(MetalSeries {
-        data: SeriesData::Str { offsets: new_offsets, chars: new_chars },
-        len: series.len,
-        dtype: DType::Utf8,
-    })
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
 }
 
 // ---------------------------------------------------------------------------
@@ -579,16 +567,12 @@ fn run_string_bitonic_passes(
 pub fn metal_string_sort(series: &MetalSeries, ascending: bool) -> PyResult<MetalSeries> {
     let (offsets, chars) = series.as_str_checked()?;
     let n = series.len;
+    let (device, queue) = MetalBackend::device_and_queue()?;
 
     if n <= 1 {
-        return Ok(MetalSeries {
-            data: SeriesData::Str { offsets: offsets.clone(), chars: chars.clone() },
-            len: n,
-            dtype: DType::Utf8,
-        });
+        return Ok(MetalSeries::from_str_parts(device, offsets.clone(), chars.clone(), n));
     }
 
-    let (device, queue) = MetalBackend::device_and_queue()?;
     let library = load_strings_library(device)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
@@ -691,11 +675,7 @@ pub fn metal_string_sort(series: &MetalSeries, ascending: bool) -> PyResult<Meta
     let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n + 1, DType::Int64);
     let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total as usize, DType::Uint8);
 
-    Ok(MetalSeries {
-        data: SeriesData::Str { offsets: new_offsets, chars: new_chars },
-        len: n,
-        dtype: DType::Utf8,
-    })
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, n))
 }
 
 // ---------------------------------------------------------------------------
@@ -725,15 +705,10 @@ fn empty_string_groupby(
         out_dtype.size_in_bytes().max(1) as u64,
         MTLResourceOptions::StorageModeShared,
     );
+    let offsets = SharedBuffer::from_metal_buffer(offsets_buf, 1, DType::Int64);
+    let chars = SharedBuffer::from_metal_buffer(chars_buf, 0, DType::Uint8);
     Ok((
-        MetalSeries {
-            data: SeriesData::Str {
-                offsets: SharedBuffer::from_metal_buffer(offsets_buf, 1, DType::Int64),
-                chars: SharedBuffer::from_metal_buffer(chars_buf, 0, DType::Uint8),
-            },
-            len: 0,
-            dtype: DType::Utf8,
-        },
+        MetalSeries::from_str_parts(device, offsets, chars, 0),
         MetalSeries::from_numeric(SharedBuffer::from_metal_buffer(val_buf, 0, out_dtype)),
     ))
 }
@@ -830,11 +805,7 @@ fn gather_key_strings(
     let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, num_groups + 1, DType::Int64);
     let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
 
-    Ok(MetalSeries {
-        data: SeriesData::Str { offsets: new_offsets, chars: new_chars },
-        len: num_groups,
-        dtype: DType::Utf8,
-    })
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, num_groups))
 }
 
 /// Initialize a hash accumulator buffer with the correct identity value.

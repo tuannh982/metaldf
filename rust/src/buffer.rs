@@ -189,4 +189,10 @@ impl SharedBuffer {
         );
         SharedBuffer { buffer: Arc::new(buffer), len: data.len(), dtype: DType::Uint8 }
     }
+
+    /// Consume self and return the underlying Metal buffer.
+    /// Used when transferring ownership into a `MetalColumn`.
+    pub fn into_metal_buffer(self) -> Buffer {
+        Arc::try_unwrap(self.buffer).unwrap_or_else(|arc| (*arc).clone())
+    }
 }

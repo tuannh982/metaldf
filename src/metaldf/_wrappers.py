@@ -14,7 +14,33 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from metaldf._deferred import DeferredSeries
 from metaldf._proxy import _ProxyMeta
+
+
+def _indexes_align(a: Any, b: Any) -> bool:
+    """True if the deferred/Metal fast path is safe to zip `a` and `b` positionally.
+
+    Mirrors the index-alignment guard in
+    ``metaldf._engine._metal._dispatch_binary``: Metal (both the per-op
+    eager kernels and the deferred bytecode-interpreter kernel) has no
+    notion of pandas' index-alignment semantics -- it just zips operands
+    positionally. Only take the fast path when indexes already match (the
+    overwhelmingly common case); otherwise fall through so pandas performs
+    real union-index alignment (NaN-filling on mismatches).
+
+    ``DeferredSeries`` doesn't track an index at all (materialization
+    always produces a fresh default `RangeIndex`), so there's nothing
+    meaningful to compare -- and checking `.index` via its `__getattr__`
+    would eagerly materialize it, defeating the point of deferring.
+    """
+    if isinstance(a, DeferredSeries) or isinstance(b, DeferredSeries):
+        return True
+    a_index = getattr(a, "index", None)
+    b_index = getattr(b, "index", None)
+    if a_index is not None and b_index is not None:
+        return a_index.equals(b_index)
+    return True
 
 
 class ProxyDataFrame(pd.DataFrame, metaclass=_ProxyMeta):
@@ -47,6 +73,42 @@ class ProxyDataFrame(pd.DataFrame, metaclass=_ProxyMeta):
             raise AttributeError(name)
         obj = object.__getattribute__(self, "_pandas_obj")
         return getattr(obj, name)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        """Assign a column, materializing DeferredSeries/ProxySeries values first.
+
+        Writes through the real ``pd.DataFrame.__setitem__`` (not
+        ``target[key] = value``) rather than through the instance's own
+        inherited ``__setitem__``, since e.g. ``self[key] = value`` would
+        just re-dispatch to this same override and recurse forever.
+
+        Writes onto *both* ``self`` and the tracked ``_pandas_obj`` when
+        they're different objects (wrapped construction, e.g.
+        ``ProxyDataFrame(_pandas_obj=some_df)`` initializes ``self`` with
+        its own copy of the data -- see ``__init__`` -- so ``self`` and
+        ``_pandas_obj`` are separate ``BlockManager``s from that point on).
+        Both need the new column: reads via the proxy itself (``proxy_df["a"]``,
+        which resolves through ``self``'s own inherited ``__getitem__``)
+        and reads via ``.to_pandas()`` (which returns ``_pandas_obj``) must
+        both see it. For direct construction, ``_pandas_obj is self`` and
+        the second write is a harmless no-op repeat of the first.
+
+        Uses ``type(value) is ProxySeries`` (not ``isinstance``) for the
+        ProxySeries check: ``_ProxyMeta.__instancecheck__`` makes
+        ``isinstance(x, ProxySeries)`` true for *any* plain ``pd.Series``
+        too (see ``_wrap_result``'s docstring below for the full
+        rationale), which would otherwise make this branch re-fire on the
+        already-materialized ``pd.Series`` from the ``DeferredSeries``
+        branch above and crash calling ``.to_pandas()`` on a plain Series.
+        """
+        if isinstance(value, DeferredSeries):
+            value = value.to_pandas()
+        elif type(value) is ProxySeries:
+            value = value.to_pandas()
+        obj = object.__getattribute__(self, "_pandas_obj")
+        pd.DataFrame.__setitem__(self, key, value)
+        if obj is not self:
+            pd.DataFrame.__setitem__(obj, key, value)
 
     def groupby(
         self,
@@ -149,14 +211,62 @@ class ProxySeries(pd.Series, metaclass=_ProxyMeta):
         return cache
 
     def _try_metal_or_fallback(self, op_name: str, other: Any, reverse: bool = False) -> Any:
-        """Dispatch to pandas directly (Metal arithmetic removed -- slower than pandas).
+        """Dispatch a binary arithmetic op, trying deferred fusion, then Metal
+        eager dispatch (non-reverse only), then pandas.
 
-        Looks the dunder up on the real ``pd.Series`` class (rather than
-        ``getattr(self._pandas_obj, dunder)``) because for a
-        directly-constructed proxy ``self._pandas_obj is self`` --
-        instance-level lookup would just call this same override again
-        and recurse forever.
+        For add/sub/mul/div, if both operands are float32-eligible (see
+        ``_can_defer`` -- ``ProxySeries``/``DeferredSeries``/plain
+        scalars, but not int32/int64 series, since the bytecode
+        interpreter kernel only supports f32 today), build a
+        ``DeferredSeries`` instead of dispatching immediately. This lets
+        chains like ``(a + b) * c`` fuse into a single Metal kernel launch
+        at materialization time rather than three separate ones.
+
+        Falls back to pandas by looking the dunder up on the real
+        ``pd.Series`` class (rather than ``getattr(self._pandas_obj,
+        dunder)``) because for a directly-constructed proxy
+        ``self._pandas_obj is self`` -- instance-level lookup would just
+        call this same override again and recurse forever.
+
+        Reverse ops (radd/rsub/rmul/rtruediv) always go straight to
+        pandas: the Metal registry's ``execute(op_name, lhs, rhs)`` has no
+        notion of operand order beyond positional lhs/rhs, so there's no
+        way to ask it for "rhs - lhs" without swapping arguments and
+        re-deriving which side is genuinely `self` -- simpler and safer to
+        just fall back for reverse ops here.
         """
+        from metaldf._deferred import BinaryOp, LoadColumn, _as_node, _can_defer
+
+        # Deferred path for float32 element-wise ops: build an expression
+        # tree instead of dispatching a kernel immediately.
+        if op_name in ("add", "sub", "mul", "div") and not reverse:
+            if _can_defer(self) and _can_defer(other) and _indexes_align(self, other):
+                size = len(self)
+                if isinstance(other, DeferredSeries):
+                    size = other.size
+                return DeferredSeries(
+                    root=BinaryOp(op_name, LoadColumn(self), _as_node(other)),
+                    size=size,
+                )
+
+        # Reverse ops: scalar OP series (e.g. `5.0 + series`)
+        if op_name in ("add", "sub", "mul", "div") and reverse:
+            if _can_defer(self) and _can_defer(other) and _indexes_align(self, other):
+                return DeferredSeries(
+                    root=BinaryOp(op_name, _as_node(other), LoadColumn(self)),
+                    size=len(self),
+                )
+
+        from metaldf._engine import execute
+        from metaldf.exceptions import MetalNotAvailable
+
+        if not reverse:
+            try:
+                result = execute(op_name, self._pandas_obj, other)
+                return _wrap_result(result)
+            except (MetalNotAvailable, KeyError, Exception):
+                pass
+
         dunder = f"__r{op_name}__" if reverse else f"__{op_name}__"
         # Map engine op names to pandas dunder names
         if dunder == "__div__":

@@ -1,14 +1,34 @@
 // MetalSeries — the public pyclass wrapping SharedBuffer (numeric dtypes)
-// and, in a later task, string data. Python only ever touches MetalSeries;
-// SharedBuffer is an internal implementation detail.
+// and string data. Python only ever touches MetalSeries; SharedBuffer is an
+// internal implementation detail.
+//
+// Internally, MetalSeries now also owns a canonical `MetalColumn` (GPU-
+// resident storage with data/null_mask/children — see `crate::column`),
+// exposed via `column()` and `view()` for the Phase 1 storage-layer
+// refactor. The pre-existing `SeriesData` representation (a `SharedBuffer`,
+// or an offsets/chars pair of `SharedBuffer`s) is kept alongside it purely
+// for backward compatibility: `as_numeric()`/`as_numeric_checked()`/
+// `as_str()`/`as_str_checked()` must keep returning `&SharedBuffer` (by
+// reference, tied to `&self`) because that's exactly what
+// reductions.rs/sort.rs/groupby.rs/strings.rs already depend on throughout
+// (`.metal_buffer()`/`.len`/`.dtype` access, and dozens of helper functions
+// typed to take `&SharedBuffer` parameters) — changing that return type
+// would ripple through all of those call sites. The `SharedBuffer`(s) in
+// `data` share the exact same underlying Metal buffer as `column`'s
+// data/children (a cheap `metal::Buffer` retain via `.clone()`, not a new
+// GPU allocation), so there's no data duplication on the GPU — just two
+// owning Rust-side handles to the same bytes.
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use numpy::PyArray1;
 use metal::MTLResourceOptions;
+use std::sync::Arc;
 
 use crate::backend::MetalBackend;
 use crate::buffer::{SharedBuffer, DType};
+use crate::column::MetalColumn;
+use crate::column_view::MetalColumnView;
 
 pub(crate) enum SeriesData {
     Numeric(SharedBuffer),
@@ -20,6 +40,7 @@ pub(crate) enum SeriesData {
 
 #[pyclass]
 pub struct MetalSeries {
+    pub(crate) column: MetalColumn,
     pub(crate) data: SeriesData,
     pub(crate) len: usize,
     pub(crate) dtype: DType,
@@ -31,28 +52,32 @@ impl MetalSeries {
     pub fn from_numpy(data: &Bound<PyArray1<f32>>) -> PyResult<MetalSeries> {
         let buf = SharedBuffer::from_numpy(data)?;
         let len = buf.len;
-        Ok(MetalSeries { data: SeriesData::Numeric(buf), len, dtype: DType::Float32 })
+        let column = MetalColumn::from_buffer(buf.metal_buffer().clone(), len, DType::Float32);
+        Ok(MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype: DType::Float32 })
     }
 
     #[staticmethod]
     pub fn from_numpy_f64(data: &Bound<PyArray1<f64>>) -> PyResult<MetalSeries> {
         let buf = SharedBuffer::from_numpy_f64(data)?;
         let len = buf.len;
-        Ok(MetalSeries { data: SeriesData::Numeric(buf), len, dtype: DType::Float64 })
+        let column = MetalColumn::from_buffer(buf.metal_buffer().clone(), len, DType::Float64);
+        Ok(MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype: DType::Float64 })
     }
 
     #[staticmethod]
     pub fn from_numpy_i32(data: &Bound<PyArray1<i32>>) -> PyResult<MetalSeries> {
         let buf = SharedBuffer::from_numpy_i32(data)?;
         let len = buf.len;
-        Ok(MetalSeries { data: SeriesData::Numeric(buf), len, dtype: DType::Int32 })
+        let column = MetalColumn::from_buffer(buf.metal_buffer().clone(), len, DType::Int32);
+        Ok(MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype: DType::Int32 })
     }
 
     #[staticmethod]
     pub fn from_numpy_i64(data: &Bound<PyArray1<i64>>) -> PyResult<MetalSeries> {
         let buf = SharedBuffer::from_numpy_i64(data)?;
         let len = buf.len;
-        Ok(MetalSeries { data: SeriesData::Numeric(buf), len, dtype: DType::Int64 })
+        let column = MetalColumn::from_buffer(buf.metal_buffer().clone(), len, DType::Int64);
+        Ok(MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype: DType::Int64 })
     }
 
     pub fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -117,11 +142,7 @@ impl MetalSeries {
         }
         let chars = SharedBuffer::from_metal_buffer(chars_buf, chars_vec.len(), DType::Uint8);
 
-        Ok(MetalSeries {
-            data: SeriesData::Str { offsets, chars },
-            len: n,
-            dtype: DType::Utf8,
-        })
+        Ok(MetalSeries::from_str_parts(device, offsets, chars, n))
     }
 
     pub fn to_strings<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
@@ -151,6 +172,56 @@ impl MetalSeries {
 }
 
 impl MetalSeries {
+    /// Reference to the canonical, GPU-resident `MetalColumn` backing this
+    /// series (Phase 1 storage-layer refactor).
+    pub fn column(&self) -> &MetalColumn {
+        &self.column
+    }
+
+    /// A lightweight, non-owning view over this series' column data, for
+    /// zero-copy kernel dispatch.
+    pub fn view(&self) -> MetalColumnView<'_> {
+        self.column.view()
+    }
+
+    /// Build a `MetalSeries` from a `MetalColumn` (numeric or Utf8).
+    pub fn from_column(col: MetalColumn) -> Self {
+        let len = col.size();
+        let dtype = col.dtype();
+        let data = if dtype == DType::Utf8 {
+            let off_col = col.child(0);
+            let char_col = col.child(1);
+            SeriesData::Str {
+                offsets: SharedBuffer::from_metal_buffer(off_col.data().clone(), off_col.size(), off_col.dtype()),
+                chars: SharedBuffer::from_metal_buffer(char_col.data().clone(), char_col.size(), char_col.dtype()),
+            }
+        } else {
+            SeriesData::Numeric(SharedBuffer::from_metal_buffer(col.data().clone(), len, dtype))
+        };
+        MetalSeries { column: col, data, len, dtype }
+    }
+
+    /// Build a string series from offsets/chars `SharedBuffer`s, deriving a
+    /// canonical Utf8 `MetalColumn` (a 1-byte dummy data buffer — Utf8's
+    /// real payload lives entirely in its children — plus `[offsets_col,
+    /// chars_col]` children) alongside the back-compat `SeriesData::Str`
+    /// used by `as_str()`/`as_str_checked()`.
+    ///
+    /// `len` is the number of strings (NOT the offsets buffer's element
+    /// count, which is `len + 1`).
+    pub(crate) fn from_str_parts(
+        device: &metal::Device,
+        offsets: SharedBuffer,
+        chars: SharedBuffer,
+        len: usize,
+    ) -> Self {
+        let off_col = MetalColumn::from_buffer(offsets.metal_buffer().clone(), offsets.len, DType::Int64);
+        let char_col = MetalColumn::from_buffer(chars.metal_buffer().clone(), chars.len, DType::Uint8);
+        let dummy = device.new_buffer(1, MTLResourceOptions::StorageModeShared);
+        let column = MetalColumn::new(Arc::new(dummy), None, DType::Utf8, len, 0, vec![off_col, char_col]);
+        MetalSeries { column, data: SeriesData::Str { offsets, chars }, len, dtype: DType::Utf8 }
+    }
+
     pub fn as_numeric(&self) -> &SharedBuffer {
         match &self.data {
             SeriesData::Numeric(buf) => buf,
@@ -186,6 +257,7 @@ impl MetalSeries {
     pub fn from_numeric(buf: SharedBuffer) -> Self {
         let len = buf.len;
         let dtype = buf.dtype;
-        MetalSeries { data: SeriesData::Numeric(buf), len, dtype }
+        let column = MetalColumn::from_buffer(buf.metal_buffer().clone(), len, dtype);
+        MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype }
     }
 }
