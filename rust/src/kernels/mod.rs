@@ -96,6 +96,7 @@ pub fn tuning() -> &'static GpuTuning {
     &GPU_TUNING
 }
 
+pub mod comparison;
 pub mod elementwise;
 pub mod reductions;
 pub mod sort;
@@ -103,6 +104,11 @@ pub mod groupby;
 pub mod strings;
 pub mod expression;
 pub mod codegen;
+pub mod scan;
+pub mod filter;
+pub mod join;
+pub mod rolling;
+pub mod datetime;
 
 include!(concat!(env!("OUT_DIR"), "/common_preamble_src.rs"));
 include!(concat!(env!("OUT_DIR"), "/elementwise_metal_src.rs"));
@@ -112,6 +118,23 @@ include!(concat!(env!("OUT_DIR"), "/groupby_metal_src.rs"));
 include!(concat!(env!("OUT_DIR"), "/strings_metal_src.rs"));
 include!(concat!(env!("OUT_DIR"), "/test_debug_metal_src.rs"));
 include!(concat!(env!("OUT_DIR"), "/expression_metal_src.rs"));
+include!(concat!(env!("OUT_DIR"), "/scan_metal_src.rs"));
+include!(concat!(env!("OUT_DIR"), "/filter_metal_src.rs"));
+include!(concat!(env!("OUT_DIR"), "/join_metal_src.rs"));
+include!(concat!(env!("OUT_DIR"), "/rolling_metal_src.rs"));
+include!(concat!(env!("OUT_DIR"), "/datetime_metal_src.rs"));
+
+include!(concat!(env!("OUT_DIR"), "/elementwise_metallib.rs"));
+include!(concat!(env!("OUT_DIR"), "/reduction_metallib.rs"));
+include!(concat!(env!("OUT_DIR"), "/sort_metallib.rs"));
+include!(concat!(env!("OUT_DIR"), "/groupby_metallib.rs"));
+include!(concat!(env!("OUT_DIR"), "/strings_metallib.rs"));
+include!(concat!(env!("OUT_DIR"), "/expression_metallib.rs"));
+include!(concat!(env!("OUT_DIR"), "/scan_metallib.rs"));
+include!(concat!(env!("OUT_DIR"), "/filter_metallib.rs"));
+include!(concat!(env!("OUT_DIR"), "/join_metallib.rs"));
+include!(concat!(env!("OUT_DIR"), "/rolling_metallib.rs"));
+include!(concat!(env!("OUT_DIR"), "/datetime_metallib.rs"));
 
 lazy_static::lazy_static! {
     static ref PIPELINE_CACHE: Mutex<HashMap<String, ComputePipelineState>> =
@@ -150,7 +173,25 @@ fn create_compile_options() -> metal::CompileOptions {
     options
 }
 
-fn load_library(device: &Device, name: &str, source: &str) -> Result<Library, String> {
+/// Load a kernel library, preferring a pre-compiled `.metallib` (near-instant)
+/// over runtime MSL source compilation (~1-5ms).
+///
+/// The pre-compiled metallib (when present) was built with conservative
+/// default GPU tuning constants and without debug instrumentation (see
+/// build.rs). If debug mode is enabled, or the pre-compiled binary fails to
+/// load for any reason (e.g. GPU family mismatch, corrupt/missing data), this
+/// falls back to compiling `source` from scratch with the correct
+/// runtime-detected tuning defines.
+fn load_library(device: &Device, name: &str, source: &str, metallib: Option<&[u8]>) -> Result<Library, String> {
+    if !is_debug_enabled() {
+        if let Some(data) = metallib {
+            if let Ok(lib) = device.new_library_with_data(data) {
+                return Ok(lib);
+            }
+            // Fall through to source compilation on failure.
+        }
+    }
+
     let options = create_compile_options();
     let full_source = with_preamble(source);
     device.new_library_with_source(&full_source, &options)
@@ -158,27 +199,47 @@ fn load_library(device: &Device, name: &str, source: &str) -> Result<Library, St
 }
 
 pub fn load_elementwise_library(device: &Device) -> Result<Library, String> {
-    load_library(device, "elementwise", ELEMENTWISE_METAL_SRC)
+    load_library(device, "elementwise", ELEMENTWISE_METAL_SRC, ELEMENTWISE_METALLIB)
 }
 
 pub fn load_reductions_library(device: &Device) -> Result<Library, String> {
-    load_library(device, "reductions", REDUCTION_METAL_SRC)
+    load_library(device, "reductions", REDUCTION_METAL_SRC, REDUCTION_METALLIB)
 }
 
 pub fn load_sort_library(device: &Device) -> Result<Library, String> {
-    load_library(device, "sort", SORT_METAL_SRC)
+    load_library(device, "sort", SORT_METAL_SRC, SORT_METALLIB)
 }
 
 pub fn load_groupby_library(device: &Device) -> Result<Library, String> {
-    load_library(device, "groupby", GROUPBY_METAL_SRC)
+    load_library(device, "groupby", GROUPBY_METAL_SRC, GROUPBY_METALLIB)
 }
 
 pub fn load_strings_library(device: &Device) -> Result<Library, String> {
-    load_library(device, "strings", STRINGS_METAL_SRC)
+    load_library(device, "strings", STRINGS_METAL_SRC, STRINGS_METALLIB)
 }
 
 pub fn load_expression_library(device: &Device) -> Result<Library, String> {
-    load_library(device, "expression", EXPRESSION_METAL_SRC)
+    load_library(device, "expression", EXPRESSION_METAL_SRC, EXPRESSION_METALLIB)
+}
+
+pub fn load_scan_library(device: &Device) -> Result<Library, String> {
+    load_library(device, "scan", SCAN_METAL_SRC, SCAN_METALLIB)
+}
+
+pub fn load_filter_library(device: &Device) -> Result<Library, String> {
+    load_library(device, "filter", FILTER_METAL_SRC, FILTER_METALLIB)
+}
+
+pub fn load_join_library(device: &Device) -> Result<Library, String> {
+    load_library(device, "join", JOIN_METAL_SRC, JOIN_METALLIB)
+}
+
+pub fn load_rolling_library(device: &Device) -> Result<Library, String> {
+    load_library(device, "rolling", ROLLING_METAL_SRC, ROLLING_METALLIB)
+}
+
+pub fn load_datetime_library(device: &Device) -> Result<Library, String> {
+    load_library(device, "datetime", DATETIME_METAL_SRC, DATETIME_METALLIB)
 }
 
 pub fn get_pipeline_state(

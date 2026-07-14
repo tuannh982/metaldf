@@ -651,6 +651,95 @@ fn metal_groupby_mean_sort(
 }
 
 // ============================================================================
+// Null-aware pre-filtering (CPU side)
+// ============================================================================
+//
+// Rather than threading null masks through the GPU hash/sort groupby
+// kernels, nulls are handled entirely on the CPU *before* dispatch: rows
+// with a null key and/or a null value are dropped, producing compact,
+// mask-free key/value buffers that the existing (null-oblivious) GPU
+// kernels can consume unchanged.
+//
+//   - Null keys are always excluded (a null group doesn't aggregate).
+//   - Null values are excluded too, which gives sum/count/min/max/mean
+//     pandas-matching "skip nulls" semantics for free, since the dropped
+//     rows never reach the accumulate pass.
+//   - Mean divides the (null-filtered) sum by the (null-filtered) count,
+//     which is exactly "sum of non-null / count of non-null".
+
+/// Copy `buf[indices[i]]` -> `out[i]` for each `i`, into a fresh
+/// `SharedBuffer` of length `indices.len()`. A plain byte-level gather
+/// (dtype-agnostic via `size_in_bytes()`), used to build compact, null-free
+/// key/value arrays for groupby's null pre-filtering.
+fn gather_compact(device: &metal::Device, buf: &SharedBuffer, indices: &[usize]) -> SharedBuffer {
+    let elem_size = buf.dtype.size_in_bytes();
+    let out_len = indices.len();
+    let out = device.new_buffer(
+        (out_len.max(1) * elem_size) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    unsafe {
+        let src = buf.metal_buffer().contents() as *const u8;
+        let dst = out.contents() as *mut u8;
+        for (i, &idx) in indices.iter().enumerate() {
+            std::ptr::copy_nonoverlapping(
+                src.add(idx * elem_size),
+                dst.add(i * elem_size),
+                elem_size,
+            );
+        }
+    }
+    SharedBuffer::from_metal_buffer(out, out_len, buf.dtype)
+}
+
+/// If `keys` and/or `values` carry a null mask, build compact (null-free)
+/// key/value series containing only the rows where BOTH the key and the
+/// value are valid, and return them. Returns `None` when neither series has
+/// a null mask — the fast path, where callers should dispatch directly on
+/// the original (unfiltered) series.
+fn filter_nulls_for_groupby(
+    keys: &MetalSeries,
+    values: &MetalSeries,
+) -> PyResult<Option<(MetalSeries, MetalSeries)>> {
+    let key_mask = keys.null_mask.as_ref();
+    let val_mask = values.null_mask.as_ref();
+
+    if key_mask.is_none() && val_mask.is_none() {
+        return Ok(None);
+    }
+
+    let keys_buf = keys.as_numeric_checked()?;
+    let values_buf = values.as_numeric_checked()?;
+
+    if keys_buf.len != values_buf.len {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "keys and values must have same length"
+        ));
+    }
+
+    let len = keys_buf.len;
+    let mut valid_indices = Vec::with_capacity(len);
+    for i in 0..len {
+        let key_valid = key_mask.map_or(true, |m| m.is_valid(i));
+        let val_valid = val_mask.map_or(true, |m| m.is_valid(i));
+        if key_valid && val_valid {
+            valid_indices.push(i);
+        }
+    }
+
+    let device = MetalBackend::device()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("No Metal device available"))?;
+
+    let filtered_keys = gather_compact(device, keys_buf, &valid_indices);
+    let filtered_values = gather_compact(device, values_buf, &valid_indices);
+
+    Ok(Some((
+        MetalSeries::from_numeric(filtered_keys),
+        MetalSeries::from_numeric(filtered_values),
+    )))
+}
+
+// ============================================================================
 // Public entry points
 // ============================================================================
 
@@ -666,6 +755,12 @@ fn metal_groupby_dispatch_inner(keys: &SharedBuffer, values: &SharedBuffer, op: 
 }
 
 fn metal_groupby_dispatch(keys: &MetalSeries, values: &MetalSeries, op: GroupOp) -> PyResult<(MetalSeries, MetalSeries)> {
+    if let Some((filtered_keys, filtered_values)) = filter_nulls_for_groupby(keys, values)? {
+        let keys_buf = filtered_keys.as_numeric_checked()?;
+        let values_buf = filtered_values.as_numeric_checked()?;
+        let (k, v) = metal_groupby_dispatch_inner(keys_buf, values_buf, op)?;
+        return Ok((MetalSeries::from_numeric(k), MetalSeries::from_numeric(v)));
+    }
     let keys_buf = keys.as_numeric_checked()?;
     let values_buf = values.as_numeric_checked()?;
     let (k, v) = metal_groupby_dispatch_inner(keys_buf, values_buf, op)?;
@@ -691,8 +786,12 @@ pub fn metal_groupby_max(keys: &MetalSeries, values: &MetalSeries) -> PyResult<(
     metal_groupby_dispatch(keys, values, GroupOp::Max)
 }
 
-/// GroupBy count (number of rows per group). `values` is only used for
-/// dtype/length validation — the count itself only depends on `keys`.
+/// GroupBy count (number of non-null values per group, matching pandas'
+/// `.count()`). When neither `keys` nor `values` carries a null mask, the
+/// GPU kernel itself only reads `keys` (`values` is used purely for
+/// dtype/length validation) — but `values`' nulls are NOT ignored: rows
+/// with a null value are dropped by `filter_nulls_for_groupby` before
+/// dispatch, so a null-value row does not contribute to its group's count.
 #[pyfunction]
 pub fn metal_groupby_count(keys: &MetalSeries, values: &MetalSeries) -> PyResult<(MetalSeries, MetalSeries)> {
     metal_groupby_dispatch(keys, values, GroupOp::Count)
@@ -703,6 +802,15 @@ pub fn metal_groupby_count(keys: &MetalSeries, values: &MetalSeries) -> PyResult
 /// Float32 result (matching pandas' float-promoting mean behavior).
 #[pyfunction]
 pub fn metal_groupby_mean(keys: &MetalSeries, values: &MetalSeries) -> PyResult<(MetalSeries, MetalSeries)> {
+    let filtered;
+    let (keys, values) = match filter_nulls_for_groupby(keys, values)? {
+        Some((fk, fv)) => {
+            filtered = (fk, fv);
+            (&filtered.0, &filtered.1)
+        }
+        None => (keys, values),
+    };
+
     let keys_buf = keys.as_numeric_checked()?;
     let values_buf = values.as_numeric_checked()?;
     let dtype = validate_groupby_buffers(keys_buf, values_buf)?;

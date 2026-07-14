@@ -52,6 +52,12 @@ try:
     register("sub", MetalEngine.metal_sub)
     register("mul", MetalEngine.metal_mul)
     register("div", MetalEngine.metal_div)
+    register("cmp_eq", MetalEngine.metal_cmp_eq)
+    register("cmp_ne", MetalEngine.metal_cmp_ne)
+    register("cmp_lt", MetalEngine.metal_cmp_lt)
+    register("cmp_le", MetalEngine.metal_cmp_le)
+    register("cmp_gt", MetalEngine.metal_cmp_gt)
+    register("cmp_ge", MetalEngine.metal_cmp_ge)
     register("sort", MetalEngine.metal_sort)
     register("argsort", MetalEngine.metal_argsort)
     register("groupby_sum", MetalEngine.metal_groupby_sum)
@@ -67,5 +73,6 @@ try:
     register("str_upper", MetalEngine.metal_string_upper)
     register("str_strip", MetalEngine.metal_string_strip)
     register("str_replace", MetalEngine.metal_string_replace)
+    register("compact", MetalEngine.metal_compact)
 except ImportError:
     pass  # Metal not built yet

@@ -43,9 +43,18 @@ impl MetalColumn {
         }
     }
 
+    /// Builder-style setter attaching (or clearing) a validity bitmask.
+    /// Used by `MetalSeries` constructors that build a `MetalColumn` via
+    /// `from_buffer`/`new` and then know whether a `NullMask` applies.
+    pub fn with_null_mask(mut self, null_mask: Option<Arc<Buffer>>) -> Self {
+        self.null_mask = null_mask;
+        self
+    }
+
     pub fn data(&self) -> &Buffer { &self.data }
     pub fn data_arc(&self) -> &Arc<Buffer> { &self.data }
     pub fn null_mask(&self) -> Option<&Buffer> { self.null_mask.as_deref() }
+    pub fn null_mask_arc(&self) -> Option<&Arc<Buffer>> { self.null_mask.as_ref() }
     pub fn dtype(&self) -> DType { self.dtype }
     pub fn size(&self) -> usize { self.size }
     pub fn offset(&self) -> usize { self.offset }

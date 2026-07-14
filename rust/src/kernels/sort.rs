@@ -4,16 +4,17 @@
 //   - N < 100K: bitonic sort (single CB, no CPU histogram overhead)
 //   - N >= 100K: radix sort (CPU histogram + GPU scatter per pass, 4 or 8 CBs)
 //
-// Supports Float32, Int32, and Int64. The CPU-side radix key conversion
-// functions below must exactly match the Metal-side `RadixTraits<T>::to_key()`
-// defined in rust/metal/types.h.
+// Supports Float32, Int32, Int64, and (via Int64's kernel_suffix/radix key
+// encoding) Datetime/Timedelta. The CPU-side radix key conversion functions
+// below must exactly match the Metal-side `RadixTraits<T>::to_key()` defined
+// in rust/metal/types.h.
 
 use pyo3::prelude::*;
 
 use metal::{MTLSize, MTLResourceOptions};
 
 use crate::backend::MetalBackend;
-use crate::buffer::{SharedBuffer, DType};
+use crate::buffer::{SharedBuffer, DType, NullMask};
 use crate::kernels::{load_sort_library, get_pipeline_state, tuning};
 use crate::series::MetalSeries;
 
@@ -24,9 +25,13 @@ const NUM_BUCKETS: usize = 1 << RADIX_BITS; // 256
 const BITONIC_MAX_N: usize = 100_000;
 
 /// Validate buffer dtype and return (length, dtype).
+///
+/// `Datetime`/`Timedelta` are included alongside `Int64` — both share its
+/// `kernel_suffix` ("int64") and radix-key encoding, so the exact same
+/// bitonic/radix kernels sort them correctly with no MSL changes needed.
 fn validate_sort_buffer(data: &SharedBuffer) -> PyResult<(usize, DType)> {
     match data.dtype {
-        DType::Float32 | DType::Int32 | DType::Int64 => Ok((data.len, data.dtype)),
+        DType::Float32 | DType::Int32 | DType::Int64 | DType::Datetime | DType::Timedelta => Ok((data.len, data.dtype)),
         _ => Err(pyo3::exceptions::PyTypeError::new_err(
             format!("Sort not supported for {:?}", data.dtype)
         )),
@@ -168,7 +173,7 @@ pub fn run_radix_sort_on_buffers(
             match dtype {
                 DType::Float32 => build_histogram!(f32, float_to_radix_key, 0xFFu32),
                 DType::Int32   => build_histogram!(i32, int32_to_radix_key, 0xFFu32),
-                DType::Int64   => build_histogram!(i64, int64_to_radix_key, 0xFFu64),
+                DType::Int64 | DType::Datetime | DType::Timedelta => build_histogram!(i64, int64_to_radix_key, 0xFFu64),
                 _ => unreachable!(),
             }
 
@@ -419,6 +424,99 @@ fn run_bitonic_argsort(
 }
 
 // ============================================================================
+// Null-aware sort support
+//
+// Strategy: rather than teaching the MSL bitonic/radix kernels about nulls,
+// we pre-process on the CPU side — copy the data buffer, overwrite null
+// positions with a dtype-appropriate sentinel that's guaranteed to sort to
+// the end (`+INF` / `T::MAX` for ascending), then run the *existing* sort
+// unmodified. Since nulls all carry the same maximal sentinel value, the
+// sort is stable-enough for our purposes: they end up contiguous at the
+// tail. Afterwards we rebuild a null mask marking exactly those trailing
+// `null_count` positions invalid — the mask has no relation to which array
+// position a given sentinel-bearing element originated from, but since all
+// nulls are indistinguishable payload-wise, that's fine.
+// ============================================================================
+
+/// Copy `data`'s buffer, replacing each position where `mask.is_valid(i)` is
+/// `false` with the dtype's ascending-sort sentinel (`+INF` for floats,
+/// `T::MAX` for ints). Valid positions are copied verbatim. Only called for
+/// dtypes `validate_sort_buffer` has already accepted (Float32/Int32/Int64/
+/// Datetime/Timedelta).
+fn build_null_sentinel_buffer(
+    device: &metal::Device,
+    data: &SharedBuffer,
+    len: usize,
+    dtype: DType,
+    mask: &NullMask,
+) -> SharedBuffer {
+    let elem_size = dtype.size_in_bytes();
+    let byte_len = (len * elem_size).max(1) as u64;
+    let buf = device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.metal_buffer().contents(), buf.contents(), len * elem_size);
+        match dtype {
+            DType::Float32 => {
+                let ptr = buf.contents() as *mut f32;
+                for i in 0..len {
+                    if !mask.is_valid(i) { *ptr.add(i) = f32::INFINITY; }
+                }
+            }
+            DType::Int32 => {
+                let ptr = buf.contents() as *mut i32;
+                for i in 0..len {
+                    if !mask.is_valid(i) { *ptr.add(i) = i32::MAX; }
+                }
+            }
+            DType::Int64 | DType::Datetime | DType::Timedelta => {
+                let ptr = buf.contents() as *mut i64;
+                for i in 0..len {
+                    if !mask.is_valid(i) { *ptr.add(i) = i64::MAX; }
+                }
+            }
+            _ => unreachable!("validate_sort_buffer restricts dtype to Float32/Int32/Int64/Datetime/Timedelta"),
+        }
+    }
+    SharedBuffer::from_metal_buffer(buf, len, dtype)
+}
+
+/// Build a packed validity bitmask for the post-sort result: the first
+/// `valid_count` positions (the real, sorted values) are valid, and the
+/// remaining `len - valid_count` positions (where the null sentinels sorted
+/// to) are null.
+fn build_nulls_last_mask(device: &metal::Device, len: usize, valid_count: usize) -> NullMask {
+    let byte_len = (len + 7) / 8;
+    let buf = device.new_buffer(byte_len.max(1) as u64, MTLResourceOptions::StorageModeShared);
+    unsafe {
+        std::ptr::write_bytes(buf.contents() as *mut u8, 0, byte_len);
+        let ptr = buf.contents() as *mut u8;
+        for i in 0..valid_count {
+            *ptr.add(i / 8) |= 1u8 << (i % 8);
+        }
+    }
+    NullMask::from_metal_buffer(buf, len)
+}
+
+/// Dispatch to bitonic (small N) or radix (large N) sort, returning the
+/// sorted values buffer. Shared by the null-free and null-aware paths of
+/// `metal_sort` so both go through the exact same selection heuristic.
+fn run_sort_dispatch(
+    device: &metal::Device,
+    queue: &metal::CommandQueue,
+    buf: &SharedBuffer,
+    len: usize,
+    dtype: DType,
+) -> PyResult<SharedBuffer> {
+    if len < BITONIC_MAX_N {
+        run_bitonic_sort(device, queue, buf, len, dtype)
+    } else {
+        let (keys0, keys1, indices0, indices1, n) = setup_radix_buffers(device, buf, len, dtype);
+        run_radix_sort_on_buffers(device, queue, &keys0, &keys1, &indices0, &indices1, n, dtype)?;
+        Ok(SharedBuffer::from_metal_buffer(keys0, len, dtype))
+    }
+}
+
+// ============================================================================
 // Public entry points
 // ============================================================================
 
@@ -428,14 +526,30 @@ pub fn metal_sort(data: &MetalSeries) -> PyResult<MetalSeries> {
     let (len, dtype) = validate_sort_buffer(buf)?;
     let (device, queue) = MetalBackend::device_and_queue()?;
 
-    let result = if len < BITONIC_MAX_N {
-        run_bitonic_sort(device, queue, buf, len, dtype)
-    } else {
-        let (keys0, keys1, indices0, indices1, n) = setup_radix_buffers(device, buf, len, dtype);
-        run_radix_sort_on_buffers(device, queue, &keys0, &keys1, &indices0, &indices1, n, dtype)?;
-        Ok(SharedBuffer::from_metal_buffer(keys0, len, dtype))
-    }?;
-    Ok(MetalSeries::from_numeric(result))
+    match &data.null_mask {
+        None => {
+            let result = run_sort_dispatch(device, queue, buf, len, dtype)?;
+            Ok(MetalSeries::from_numeric(result))
+        }
+        Some(mask) => {
+            let valid_count = mask.count_valid();
+            let null_count = len - valid_count;
+
+            if null_count == 0 {
+                // Mask present but nothing actually null (e.g. an all-valid
+                // mask built defensively upstream) — sort directly, no
+                // sentinel substitution needed, and the result carries no
+                // mask either.
+                let result = run_sort_dispatch(device, queue, buf, len, dtype)?;
+                return Ok(MetalSeries::from_numeric(result));
+            }
+
+            let sentinel_buf = build_null_sentinel_buffer(device, buf, len, dtype, mask);
+            let result = run_sort_dispatch(device, queue, &sentinel_buf, len, dtype)?;
+            let out_mask = build_nulls_last_mask(device, len, valid_count);
+            Ok(MetalSeries::from_numeric_with_mask(result, out_mask))
+        }
+    }
 }
 
 #[pyfunction]

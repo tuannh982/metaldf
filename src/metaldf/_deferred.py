@@ -36,15 +36,38 @@ OP_EXP = 35
 OP_LOG = 36
 OP_CEIL = 37
 OP_FLOOR = 38
+OP_AND = 40
+OP_OR = 41
+OP_NOT = 42
+OP_SIN = 43
+OP_COS = 44
+OP_TAN = 45
+OP_ASIN = 46
+OP_ACOS = 47
+OP_ATAN = 48
+OP_SINH = 49
+OP_COSH = 50
+OP_TANH = 51
+OP_LOG2 = 52
+OP_LOG10 = 53
+OP_ROUND = 54
+OP_TRUNC = 55
+OP_CBRT = 56
 
 _BINARY_OPS = {
     "add": OP_ADD, "sub": OP_SUB, "mul": OP_MUL, "div": OP_DIV, "mod": OP_MOD,
     "eq": OP_EQ, "ne": OP_NE, "lt": OP_LT, "le": OP_LE, "gt": OP_GT, "ge": OP_GE,
+    "and": OP_AND, "or": OP_OR,
 }
 
 _UNARY_OPS = {
     "abs": OP_ABS, "neg": OP_NEG, "sqrt": OP_SQRT, "exp": OP_EXP, "log": OP_LOG,
-    "ceil": OP_CEIL, "floor": OP_FLOOR,
+    "ceil": OP_CEIL, "floor": OP_FLOOR, "not": OP_NOT,
+    "sin": OP_SIN, "cos": OP_COS, "tan": OP_TAN,
+    "asin": OP_ASIN, "acos": OP_ACOS, "atan": OP_ATAN,
+    "sinh": OP_SINH, "cosh": OP_COSH, "tanh": OP_TANH,
+    "log2": OP_LOG2, "log10": OP_LOG10,
+    "round": OP_ROUND, "trunc": OP_TRUNC, "cbrt": OP_CBRT,
 }
 
 
@@ -248,14 +271,60 @@ class DeferredSeries:
             return DeferredSeries(BinaryOp("div", _as_node(other), self.root), self.size)
         return NotImplemented
 
+    # Unary math -- chain more deferred ops (Phase 5: trig/log/rounding).
+    # Each wraps the current tree in a UnaryOp node rather than dispatching
+    # immediately, so e.g. `(a + b).sin()` still fuses into a single kernel.
+    def sin(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("sin", self.root), self.size)
+
+    def cos(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("cos", self.root), self.size)
+
+    def tan(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("tan", self.root), self.size)
+
+    def asin(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("asin", self.root), self.size)
+
+    def acos(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("acos", self.root), self.size)
+
+    def atan(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("atan", self.root), self.size)
+
+    def sinh(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("sinh", self.root), self.size)
+
+    def cosh(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("cosh", self.root), self.size)
+
+    def tanh(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("tanh", self.root), self.size)
+
+    def log2(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("log2", self.root), self.size)
+
+    def log10(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("log10", self.root), self.size)
+
+    def round(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("round", self.root), self.size)
+
+    def trunc(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("trunc", self.root), self.size)
+
+    def cbrt(self) -> DeferredSeries:
+        return DeferredSeries(UnaryOp("cbrt", self.root), self.size)
+
     def _fused_reduce(self, op: str) -> Any:
         """Try the fused expression-reduce kernel. Returns a scalar, or ``None``.
 
         ``None`` signals "not applicable / failed" -- either the root is a
         plain ``LoadColumn`` (no expression to fuse; the ordinary
-        ``ProxySeries`` reduction already handles that case directly) or the
-        fused kernel raised, in which case the caller falls back to
-        materializing the tree and reducing with pandas.
+        ``ProxySeries`` reduction already handles that case directly), any
+        input column contains NaN (the fused kernel doesn't skip nulls, so
+        we fall back to materialize-then-pandas-reduce which honours
+        ``skipna=True``), or the fused kernel raised.
         """
         if isinstance(self.root, LoadColumn):
             return None
@@ -264,14 +333,19 @@ class DeferredSeries:
         from metaldf._engine._metal import _extract_array, _make_series
 
         columns = self._collect_columns()
-        column_index = {id(col): i for i, col in enumerate(columns)}
-        program = self._compile_bytecode(column_index)
 
-        metal_cols = []
+        arrays = []
         for col in columns:
             pandas_obj = object.__getattribute__(col, "_pandas_obj")
             arr = _extract_array(pandas_obj)
-            metal_cols.append(_make_series(arr))
+            if arr.dtype == np.dtype(np.float32) and np.any(np.isnan(arr)):
+                return None
+            arrays.append(arr)
+
+        column_index = {id(col): i for i, col in enumerate(columns)}
+        program = self._compile_bytecode(column_index)
+
+        metal_cols = [_make_series(arr) for arr in arrays]
 
         try:
             return metaldf_engine.eval_expression_reduce(op, program, metal_cols, self.size)

@@ -19,6 +19,24 @@ pub enum DType {
     Int32,
     Int64,
     Uint8,
+    /// Boolean data column (comparison results, logical ops). Stored as one
+    /// `uint8_t` per element (0 = false, 1 = true) — NOT packed bits. This is
+    /// distinct from `NullMask`, which IS a packed validity bitmask; `Bool`
+    /// is an ordinary data dtype that happens to share `Uint8`'s storage
+    /// width.
+    Bool,
+    /// Unsigned 32-bit data column (one `uint32_t` per element). Used
+    /// alongside `Int32` by the prefix-sum/scan kernel (Task 3.1) — the two
+    /// share identical two's-complement addition semantics, but a distinct
+    /// `Uint32` dtype keeps unsigned-count buffers (e.g. future boolean-mask
+    /// scan output consumed by Phase 4 filtering) self-describing.
+    Uint32,
+    /// Datetime column (nanoseconds since 1970-01-01 UTC). Stored as int64.
+    /// Uses `kernel_suffix = "int64"` so all int64 kernels work automatically.
+    Datetime,
+    /// Timedelta column (duration in nanoseconds). Stored as int64.
+    /// Uses `kernel_suffix = "int64"` so all int64 kernels work automatically.
+    Timedelta,
     Utf8,
 }
 
@@ -30,6 +48,10 @@ impl DType {
             DType::Int32 => 4,
             DType::Int64 => 8,
             DType::Uint8 => 1,
+            DType::Bool => 1,
+            DType::Uint32 => 4,
+            DType::Datetime => 8,
+            DType::Timedelta => 8,
             DType::Utf8 => panic!("Utf8 is a series-level dtype, not a buffer-level dtype"),
         }
     }
@@ -41,6 +63,10 @@ impl DType {
             DType::Int32 => "int32",
             DType::Int64 => "int64",
             DType::Uint8 => "uint8",
+            DType::Bool => "bool",
+            DType::Uint32 => "uint32",
+            DType::Datetime => "int64",
+            DType::Timedelta => "int64",
             DType::Utf8 => panic!("Utf8 has no kernel suffix"),
         }
     }
@@ -49,6 +75,7 @@ impl DType {
         match self {
             DType::Float32 | DType::Int32 => 4,
             DType::Float64 | DType::Int64 => 8,
+            DType::Datetime | DType::Timedelta => 8,
             _ => panic!("radix_passes not supported for {:?}", self),
         }
     }
@@ -73,6 +100,10 @@ impl DType {
                 let p = ptr as *mut i64;
                 for i in start..end { *p.add(i) = i64::MAX; }
             }
+            DType::Datetime | DType::Timedelta => {
+                let p = ptr as *mut i64;
+                for i in start..end { *p.add(i) = i64::MAX; }
+            }
             _ => panic!("fill_max not supported for {:?}", self),
         }
     }
@@ -92,6 +123,10 @@ pub struct SharedBuffer {
 fn from_numpy_inner(ptr: *const u8, byte_len: usize, len: usize, dtype: DType) -> PyResult<SharedBuffer> {
     let device = MetalBackend::device()
         .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("No Metal device available"))?;
+    if byte_len == 0 {
+        let buffer = device.new_buffer(1, MTLResourceOptions::StorageModeShared);
+        return Ok(SharedBuffer { buffer: Arc::new(buffer), len: 0, dtype });
+    }
     let buffer = device.new_buffer_with_bytes_no_copy(
         ptr as *const _, byte_len as u64, MTLResourceOptions::StorageModeShared, None,
     );
@@ -143,12 +178,34 @@ impl SharedBuffer {
         from_numpy_inner(s.as_ptr() as *const u8, s.len() * 8, s.len(), DType::Int64)
     }
 
+    /// Build a `Uint32`-dtype buffer from a numpy `uint32` array (see
+    /// `DType::Uint32` docs — used by the prefix-sum/scan kernel).
+    pub fn from_numpy_u32(data: &Bound<PyArray1<u32>>) -> PyResult<SharedBuffer> {
+        let r = data.readonly();
+        let s = r.as_slice().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("numpy: {e}")))?;
+        from_numpy_inner(s.as_ptr() as *const u8, s.len() * 4, s.len(), DType::Uint32)
+    }
+
+    /// Build a `Bool`-dtype buffer from a numpy `uint8` array (values
+    /// expected to be 0 or 1). Bool storage is one byte per element, same
+    /// width as `Uint8`, but tracked as its own dtype so kernel dispatch and
+    /// `dtype()` reporting distinguish "boolean data" from "raw bytes".
+    pub fn from_numpy_bool(data: &Bound<PyArray1<u8>>) -> PyResult<SharedBuffer> {
+        let r = data.readonly();
+        let s = r.as_slice().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("numpy: {e}")))?;
+        from_numpy_inner(s.as_ptr() as *const u8, s.len(), s.len(), DType::Bool)
+    }
+
     pub fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         match self.dtype {
             DType::Float32 => impl_to_numpy_arm!(self, py, f32),
             DType::Float64 => impl_to_numpy_arm!(self, py, f64),
             DType::Int32   => impl_to_numpy_arm!(self, py, i32),
             DType::Int64   => impl_to_numpy_arm!(self, py, i64),
+            DType::Bool    => impl_to_numpy_arm!(self, py, u8),
+            DType::Uint32  => impl_to_numpy_arm!(self, py, u32),
+            DType::Datetime  => impl_to_numpy_arm!(self, py, i64),
+            DType::Timedelta => impl_to_numpy_arm!(self, py, i64),
             _ => Err(pyo3::exceptions::PyTypeError::new_err(
                 format!("to_numpy not supported for {:?}", self.dtype)
             )),
@@ -194,5 +251,110 @@ impl SharedBuffer {
     /// Used when transferring ownership into a `MetalColumn`.
     pub fn into_metal_buffer(self) -> Buffer {
         Arc::try_unwrap(self.buffer).unwrap_or_else(|arc| (*arc).clone())
+    }
+}
+
+/// NullMask wraps a packed validity bitmask buffer (1 bit per element; bit
+/// set = valid, bit clear = null) stored in `MTLStorageModeShared` memory so
+/// both the CPU and GPU can read/write it directly. See
+/// `rust/metal/common/04_null_mask.h` for the matching MSL-side helpers
+/// (`is_valid`/`set_valid`/`set_invalid`) that kernels use against the same
+/// bit layout.
+pub struct NullMask {
+    buffer: Arc<Buffer>,
+    len: usize,
+}
+
+impl NullMask {
+    /// Allocate a mask with every bit set (all `len` elements valid).
+    pub fn new_all_valid(device: &metal::Device, len: usize) -> Self {
+        let byte_len = (len + 7) / 8;
+        let buf = device.new_buffer(
+            byte_len.max(1) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        unsafe {
+            std::ptr::write_bytes(buf.contents() as *mut u8, 0xFF, byte_len);
+        }
+        NullMask { buffer: Arc::new(buf), len }
+    }
+
+    /// Scan a float32 slice for NaNs, building a validity bitmask (NaN =
+    /// null) and a cleaned copy of the data with NaNs replaced by `0.0`
+    /// (GPU kernels never need to special-case NaN payloads — they just
+    /// consult the mask). Returns `None` for the mask when no NaNs were
+    /// found, since an all-valid column doesn't need one tracked at all.
+    pub fn from_numpy_nans(device: &metal::Device, arr: &[f32]) -> (Vec<f32>, Option<NullMask>) {
+        let len = arr.len();
+        let byte_len = (len + 7) / 8;
+        let mut mask_bytes = vec![0xFFu8; byte_len.max(1)];
+        let mut cleaned = Vec::with_capacity(len);
+        let mut has_null = false;
+
+        for (i, &v) in arr.iter().enumerate() {
+            if v.is_nan() {
+                has_null = true;
+                mask_bytes[i / 8] &= !(1u8 << (i % 8));
+                cleaned.push(0.0);
+            } else {
+                cleaned.push(v);
+            }
+        }
+
+        if !has_null {
+            return (cleaned, None);
+        }
+
+        let buf = device.new_buffer_with_data(
+            mask_bytes.as_ptr() as *const _,
+            byte_len.max(1) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        (cleaned, Some(NullMask { buffer: Arc::new(buf), len }))
+    }
+
+    /// Create from an existing Metal buffer (used internally by kernels).
+    pub fn from_metal_buffer(buffer: Buffer, len: usize) -> Self {
+        NullMask { buffer: Arc::new(buffer), len }
+    }
+
+    pub fn metal_buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+
+    /// A cloned `Arc` handle to the same underlying Metal buffer, for
+    /// storing alongside a `MetalColumn`'s `null_mask: Option<Arc<Buffer>>`.
+    pub fn buffer_arc(&self) -> Arc<Buffer> {
+        self.buffer.clone()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_valid(&self, idx: usize) -> bool {
+        let ptr = self.buffer.contents() as *const u8;
+        unsafe { (*ptr.add(idx / 8) & (1u8 << (idx % 8))) != 0 }
+    }
+
+    pub fn count_valid(&self) -> usize {
+        let ptr = self.buffer.contents() as *const u8;
+        let byte_len = (self.len + 7) / 8;
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, byte_len) };
+        let remainder = self.len % 8;
+        if remainder == 0 || byte_len == 0 {
+            bytes.iter().map(|b| b.count_ones()).sum::<u32>() as usize
+        } else {
+            let full: u32 = bytes[..byte_len - 1].iter().map(|b| b.count_ones()).sum();
+            let last_mask = (1u8 << remainder) - 1;
+            let last = (bytes[byte_len - 1] & last_mask).count_ones();
+            (full + last) as usize
+        }
+    }
+}
+
+impl Clone for NullMask {
+    fn clone(&self) -> Self {
+        NullMask { buffer: self.buffer.clone(), len: self.len }
     }
 }

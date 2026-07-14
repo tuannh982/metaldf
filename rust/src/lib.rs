@@ -10,7 +10,11 @@ pub mod series;
 use backend::{BatchContext, MetalBackend};
 use series::MetalSeries;
 use kernels::{is_debug_enabled, set_debug_enabled, detect_gpu_family, tuning};
-use kernels::elementwise::{metal_binary_op, metal_binary_op_batched, metal_unary_op};
+use kernels::comparison::metal_compare_op;
+use kernels::elementwise::{
+    metal_binary_op, metal_binary_op_batched, metal_unary_op,
+    metal_logical_and, metal_logical_or, metal_logical_not,
+};
 use kernels::reductions::{metal_sum, metal_min, metal_max, metal_mean};
 use kernels::sort::{metal_sort, metal_argsort};
 use kernels::groupby::{metal_groupby_sum, metal_groupby_mean, metal_groupby_min, metal_groupby_max, metal_groupby_count};
@@ -22,7 +26,15 @@ use kernels::strings::{
     metal_string_sort, metal_string_groupby,
 };
 use kernels::expression::{eval_expression, eval_expression_reduce};
-use kernels::codegen::eval_expression_codegen;
+use kernels::codegen::{eval_expression_codegen, eval_multi_expression_codegen};
+use kernels::scan::metal_prefix_sum;
+use kernels::filter::{metal_compact, metal_take};
+use kernels::join::metal_hash_join;
+use kernels::rolling::{metal_rolling_sum, metal_rolling_min, metal_rolling_max, metal_rolling_count, metal_rolling_mean};
+use kernels::datetime::{
+    metal_dt_year, metal_dt_month, metal_dt_day,
+    metal_dt_hour, metal_dt_minute, metal_dt_second, metal_dt_dayofweek,
+};
 
 #[pyfunction]
 fn metal_gpu_info(py: Python) -> PyResult<PyObject> {
@@ -71,6 +83,10 @@ fn metaldf_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(begin_batch))?;
     m.add_wrapped(wrap_pyfunction!(batch_commit))?;
     m.add_wrapped(wrap_pyfunction!(metal_unary_op))?;
+    m.add_wrapped(wrap_pyfunction!(metal_logical_and))?;
+    m.add_wrapped(wrap_pyfunction!(metal_logical_or))?;
+    m.add_wrapped(wrap_pyfunction!(metal_logical_not))?;
+    m.add_wrapped(wrap_pyfunction!(metal_compare_op))?;
     m.add_wrapped(wrap_pyfunction!(metal_sum))?;
     m.add_wrapped(wrap_pyfunction!(metal_min))?;
     m.add_wrapped(wrap_pyfunction!(metal_max))?;
@@ -102,7 +118,24 @@ fn metaldf_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(eval_expression))?;
     m.add_wrapped(wrap_pyfunction!(eval_expression_reduce))?;
     m.add_wrapped(wrap_pyfunction!(eval_expression_codegen))?;
+    m.add_wrapped(wrap_pyfunction!(eval_multi_expression_codegen))?;
     m.add_wrapped(wrap_pyfunction!(metal_gpu_info))?;
+    m.add_wrapped(wrap_pyfunction!(metal_prefix_sum))?;
+    m.add_wrapped(wrap_pyfunction!(metal_compact))?;
+    m.add_wrapped(wrap_pyfunction!(metal_take))?;
+    m.add_wrapped(wrap_pyfunction!(metal_hash_join))?;
+    m.add_wrapped(wrap_pyfunction!(metal_rolling_sum))?;
+    m.add_wrapped(wrap_pyfunction!(metal_rolling_min))?;
+    m.add_wrapped(wrap_pyfunction!(metal_rolling_max))?;
+    m.add_wrapped(wrap_pyfunction!(metal_rolling_count))?;
+    m.add_wrapped(wrap_pyfunction!(metal_rolling_mean))?;
+    m.add_wrapped(wrap_pyfunction!(metal_dt_year))?;
+    m.add_wrapped(wrap_pyfunction!(metal_dt_month))?;
+    m.add_wrapped(wrap_pyfunction!(metal_dt_day))?;
+    m.add_wrapped(wrap_pyfunction!(metal_dt_hour))?;
+    m.add_wrapped(wrap_pyfunction!(metal_dt_minute))?;
+    m.add_wrapped(wrap_pyfunction!(metal_dt_second))?;
+    m.add_wrapped(wrap_pyfunction!(metal_dt_dayofweek))?;
 
     m.add_wrapped(wrap_pyfunction!(py_set_debug_enabled))?;
     m.add_wrapped(wrap_pyfunction!(py_is_debug_enabled))?;

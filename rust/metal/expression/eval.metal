@@ -68,6 +68,20 @@ kernel void eval_expression_f32(
                 case OP_LOG:   stack[sp-1] = log(a);   break;
                 case OP_CEIL:  stack[sp-1] = ceil(a);  break;
                 case OP_FLOOR: stack[sp-1] = floor(a); break;
+                case OP_SIN:   stack[sp-1] = sin(a);   break;
+                case OP_COS:   stack[sp-1] = cos(a);   break;
+                case OP_TAN:   stack[sp-1] = tan(a);   break;
+                case OP_ASIN:  stack[sp-1] = asin(a);  break;
+                case OP_ACOS:  stack[sp-1] = acos(a);  break;
+                case OP_ATAN:  stack[sp-1] = atan(a);  break;
+                case OP_SINH:  stack[sp-1] = sinh(a);  break;
+                case OP_COSH:  stack[sp-1] = cosh(a);  break;
+                case OP_TANH:  stack[sp-1] = tanh(a);  break;
+                case OP_LOG2:  stack[sp-1] = log2(a);  break;
+                case OP_LOG10: stack[sp-1] = log10(a); break;
+                case OP_ROUND: stack[sp-1] = rint(a);  break;
+                case OP_TRUNC: stack[sp-1] = trunc(a); break;
+                case OP_CBRT:  stack[sp-1] = copysign(pow(abs(a), 1.0f/3.0f), a); break;
             }
         }
     }

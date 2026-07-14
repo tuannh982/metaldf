@@ -100,7 +100,9 @@ fn decompile_to_expr(program: &[u8]) -> String {
             continue;
         }
 
-        // Opcodes 32-38: unary ops.
+        // Opcodes 32-38: unary ops. Opcodes 43-56: Phase 5 trig/log/rounding
+        // unary ops (39-42 are reserved for OP_AND/OP_OR/OP_NOT, which this
+        // codegen path doesn't implement).
         if op >= 32 {
             let a = stack.pop().unwrap_or_default();
             let expr = match op {
@@ -111,6 +113,20 @@ fn decompile_to_expr(program: &[u8]) -> String {
                 36 => format!("log({})", a),
                 37 => format!("ceil({})", a),
                 38 => format!("floor({})", a),
+                43 => format!("sin({})", a),
+                44 => format!("cos({})", a),
+                45 => format!("tan({})", a),
+                46 => format!("asin({})", a),
+                47 => format!("acos({})", a),
+                48 => format!("atan({})", a),
+                49 => format!("sinh({})", a),
+                50 => format!("cosh({})", a),
+                51 => format!("tanh({})", a),
+                52 => format!("log2({})", a),
+                53 => format!("log10({})", a),
+                54 => format!("rint({})", a),
+                55 => format!("trunc({})", a),
+                56 => format!("copysign(pow(abs({0}), 1.0f/3.0f), {0})", a),
                 _ => format!("/* unknown unary op {} */", op),
             };
             stack.push(expr);
@@ -176,6 +192,177 @@ fn compile_and_cache(
     cache.insert(prog_hash, pipeline.clone());
 
     Ok(pipeline)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-output codegen (Task 8.1: multi-column expression fusion)
+// ---------------------------------------------------------------------------
+
+/// Hash multiple programs + column count + program count for the multi-output
+/// cache. Different from `hash_program` because each combination of programs
+/// and shared column arity produces a unique kernel.
+fn hash_multi_programs(programs: &[Vec<u8>], num_cols: usize) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for prog in programs {
+        prog.hash(&mut hasher);
+    }
+    num_cols.hash(&mut hasher);
+    programs.len().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Generate a single MSL kernel with `num_cols` shared input columns and
+/// `programs.len()` output buffers. Each program is decompiled into an MSL
+/// expression that writes to its corresponding `outN[i]`.
+fn codegen_msl_multi(programs: &[Vec<u8>], num_cols: usize, func_name: &str) -> String {
+    let mut params = String::new();
+    for i in 0..num_cols {
+        params.push_str(&format!(
+            "    device const float* c{} [[buffer({})]],\n", i, i
+        ));
+    }
+    for j in 0..programs.len() {
+        params.push_str(&format!(
+            "    device float* out{} [[buffer({})]],\n", j, num_cols + j
+        ));
+    }
+    params.push_str("    uint i [[thread_position_in_grid]]");
+
+    let mut body = String::new();
+    for (j, program) in programs.iter().enumerate() {
+        let expr = decompile_to_expr(program);
+        body.push_str(&format!("    out{}[i] = {};\n", j, expr));
+    }
+
+    format!(
+        "#pragma clang fp contract(off)\n\
+         #include <metal_stdlib>\nusing namespace metal;\n\n\
+         kernel void {}(\n{}\n) {{\n{}}}\n",
+        func_name, params, body
+    )
+}
+
+/// Evaluate multiple bytecode programs against shared input columns by
+/// generating a single MSL kernel with multiple output buffers. Each program
+/// writes to its own output buffer in a single GPU dispatch, so shared input
+/// columns are read only once from GPU memory.
+///
+/// Returns one `MetalSeries` per program, in the same order as `programs`.
+#[pyfunction]
+pub fn eval_multi_expression_codegen(
+    programs: Vec<Vec<u8>>,
+    columns: Vec<PyRef<MetalSeries>>,
+    size: usize,
+) -> PyResult<Vec<MetalSeries>> {
+    if programs.is_empty() || size == 0 {
+        return Ok(vec![]);
+    }
+    if columns.len() > 8 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Too many input columns (max 8)",
+        ));
+    }
+
+    let device = MetalBackend::device()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("No Metal device"))?;
+
+    let prog_hash = hash_multi_programs(&programs, columns.len());
+
+    // Check cache
+    let pipeline = {
+        let cache = CODEGEN_CACHE.lock().unwrap();
+        cache.get(&prog_hash).cloned()
+    };
+
+    let pipeline = match pipeline {
+        Some(p) => p,
+        None => {
+            let func_name = format!("fused_multi_{:016x}", prog_hash);
+            let source = codegen_msl_multi(&programs, columns.len(), &func_name);
+
+            let library = device
+                .new_library_with_source(&source, &CompileOptions::new())
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Multi-codegen compile failed: {:?}",
+                        e
+                    ))
+                })?;
+            let function = library.get_function(&func_name, None).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Function '{}' not found: {:?}",
+                    func_name, e
+                ))
+            })?;
+            let p = device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Pipeline creation failed: {:?}",
+                        e
+                    ))
+                })?;
+
+            let mut cache = CODEGEN_CACHE.lock().unwrap();
+            cache.insert(prog_hash, p.clone());
+            p
+        }
+    };
+
+    let queue = MetalBackend::queue()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("No Metal queue"))?;
+
+    // Allocate output buffers
+    let mut out_bufs = Vec::with_capacity(programs.len());
+    for _ in 0..programs.len() {
+        out_bufs.push(device.new_buffer(
+            (size * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        ));
+    }
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+
+    // Bind input columns
+    for (i, col) in columns.iter().enumerate() {
+        let buf = col.as_numeric_checked().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err("Non-numeric column in multi-output codegen")
+        })?;
+        enc.set_buffer(i as u64, Some(buf.metal_buffer()), 0);
+    }
+
+    // Bind output buffers
+    for (j, out_buf) in out_bufs.iter().enumerate() {
+        enc.set_buffer((columns.len() + j) as u64, Some(out_buf), 0);
+    }
+
+    let tg_size = THREADGROUP_SIZE.min(size as u64);
+    enc.dispatch_threads(
+        MTLSize::new(size as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "GPU execution failed for multi-output kernel",
+        ));
+    }
+
+    // Wrap each output buffer as a MetalSeries
+    let results: Vec<MetalSeries> = out_bufs
+        .into_iter()
+        .map(|buf| {
+            let result_buf = SharedBuffer::from_metal_buffer(buf, size, DType::Float32);
+            MetalSeries::from_numeric(result_buf)
+        })
+        .collect();
+
+    Ok(results)
 }
 
 /// Evaluate a bytecode `program` against up to 8 input `columns` by

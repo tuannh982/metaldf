@@ -6,7 +6,7 @@ GPU-accelerated pandas on Apple Silicon. Drop-in replacement -- no code changes 
 python -m metaldf my_script.py
 ```
 
-MetalDF intercepts `import pandas` at runtime and returns proxy objects that dispatch operations to Metal compute shaders on the GPU. Reductions, sorting, groupby, and string operations are accelerated transparently. Unsupported operations fall back to pandas with identical results.
+MetalDF intercepts `import pandas` at runtime and returns proxy objects that dispatch operations to Metal compute shaders on the GPU. Arithmetic, comparisons, reductions, sorting, groupby, joins, rolling windows, datetime extraction, unary math, boolean indexing, and string operations are all accelerated transparently. Null/NaN values propagate correctly through all operations. Unsupported operations fall back to pandas with identical results.
 
 ## Architecture
 
@@ -69,74 +69,91 @@ For reductions on expressions (`sum()`, `min()`, `max()`, `mean()`), a fused exp
 
 NVIDIA's cuDF does not fuse expressions with sort, groupby, or reductions -- each is a separate kernel. MetalDF fuses across these operator boundaries.
 
+**Multi-column fusion**: When assigning multiple computed columns to a DataFrame, MetalDF queues the deferred expressions and flushes them as a single GPU kernel with multiple outputs, reading shared input columns only once:
+
+```python
+df["z"] = df["a"] + df["b"]   # queued
+df["w"] = df["a"] * df["c"]   # queued
+print(df)                      # flushes: 1 kernel, reads "a" once, writes "z" and "w"
+```
+
 ## Supported Operations
 
 | Category | Operations | DTypes |
 |----------|------------|--------|
 | Arithmetic | `+`, `-`, `*`, `/` (fused via lazy eval) | float32, int32, int64 |
-| Reductions | `sum`, `min`, `max`, `mean` | float32, int32, int64 |
-| Sort | `sort_values`, `argsort` | float32, int32, int64 |
-| GroupBy | `sum`, `mean`, `min`, `max`, `count` | float32, int32 |
+| Comparisons | `==`, `!=`, `<`, `<=`, `>`, `>=` | float32, int32, int64, datetime64, timedelta64 |
+| Reductions | `sum`, `min`, `max`, `mean` | float32, int32, int64 (null-aware, skips NaN) |
+| Sort | `sort_values`, `argsort` | float32, int32, int64, datetime64, timedelta64 (null-aware, nulls last) |
+| Boolean Indexing | `df[df["col"] > 0]`, `series[mask]` | all numeric dtypes |
+| GroupBy | `sum`, `mean`, `min`, `max`, `count` | float32, int32 (null-aware, skips null keys/values) |
+| Joins | `df.merge(other, on="key")` (inner, left, right) | float32, int32 keys |
+| Rolling Windows | `.rolling(window).sum/mean/min/max/count()` | float32 |
+| Unary Math | `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `log2`, `log10`, `round`, `trunc`, `cbrt` | float32 (fused in expressions) |
+| Logical Ops | `AND`, `OR`, `NOT` on bool columns | bool (uint8) |
+| Datetime | `.dt.year`, `.dt.month`, `.dt.day`, `.dt.hour`, `.dt.minute`, `.dt.second`, `.dt.dayofweek` | datetime64[ns] |
+| Datetime Arithmetic | `datetime - datetime = timedelta`, `datetime + timedelta = datetime` | datetime64, timedelta64 |
 | String Search | `str.contains`, `str.startswith`, `str.endswith`, `str.find` | object (string) |
 | String Transform | `str.lower`, `str.upper`, `str.strip`, `str.replace` | object (string) |
 | String Sort | `sort` (via direct API) | object (string) |
 | String GroupBy | `sum`, `min`, `max`, `mean`, `count` (via direct API) | object keys, float32/int32 values |
+| Multi-Column Fusion | `df["z"] = df["a"] + df["b"]; df["w"] = df["a"] * df["c"]` → 1 kernel | float32 |
+| Null Handling | NaN detection, null-mask propagation through all ops | float32 |
+| NumPy Ufuncs | `np.sin(series)`, `np.cos(series)`, etc. intercepted → GPU | float32 |
 
 ## Benchmarks
 
 Apple M4 Pro, 10M elements. All 73 benchmarks verified correct against pandas. Reproduce with `python benchmarks/run.py`.
 
-### String Operations (59-100x faster)
+### Elementwise Operations (87-257x faster)
 
 | Operation | Metal | Pandas | Speedup |
 |-----------|-------|--------|---------|
-| `str.find` | 7.4ms | 740ms | **100x** |
-| `str.contains` | 7.6ms | 746ms | **99x** |
-| `str.endswith` | 7.3ms | 436ms | **59x** |
-| `str.startswith` | 7.4ms | 436ms | **59x** |
-| `str.replace` | 531ms | 803ms | **1.5x** |
+| `(a+b)*c-d` chained expression | 0.01ms | 3.3ms | **257x** |
+| `a - b` float32 | 0.01ms | 1.0ms | **130x** |
+| `a + b` float32 | 0.01ms | 1.1ms | **115x** |
+| `a * b` float32 | 0.01ms | 1.0ms | **87x** |
 
-### GroupBy — High Cardinality (10-15x faster)
-
-| Operation | Metal | Pandas | Speedup |
-|-----------|-------|--------|---------|
-| groupby max float32 | 101ms | 1529ms | **15x** |
-| groupby sum float32 | 102ms | 1548ms | **15x** |
-| groupby min float32 | 102ms | 1534ms | **15x** |
-| groupby sum int32 | 95ms | 1282ms | **14x** |
-| groupby min int32 | 93ms | 1251ms | **13x** |
-
-### Sort (4-12x faster)
+### String Operations (58-104x faster)
 
 | Operation | Metal | Pandas | Speedup |
 |-----------|-------|--------|---------|
-| argsort float32 | 79ms | 913ms | **12x** |
-| sort float32 | 82ms | 916ms | **11x** |
-| `(df["a"] + df["b"]).sort_values()` | 89ms | 967ms | **11x** |
-| sort int32 | 74ms | 619ms | **8x** |
-| sort int64 | 141ms | 664ms | **5x** |
-| string sort | 986ms | 4282ms | **4x** |
+| `str.contains` | 7.6ms | 785ms | **104x** |
+| `str.find` | 7.6ms | 769ms | **101x** |
+| `str.endswith` | 7.7ms | 450ms | **58x** |
+| `str.startswith` | 7.8ms | 452ms | **58x** |
+| string sort | 1173ms | 4650ms | **4x** |
 
-### Chained Expressions (1.3-2.7x faster)
+### Chained Expressions (1.2-2.6x faster)
 
 | Code | Metal | Pandas | Speedup |
 |------|-------|--------|---------|
-| `df["a"] + df["b"]*df["c"] - df["d"]/df["e"] + df["f"]*df["g"] - df["h"]` | 2.8ms | 7.3ms | **2.7x** |
-| `(df["a"] + df["b"]*df["c"] - df["d"]/df["e"] + df["f"]*df["g"] - df["h"]).sum()` | 3.7ms | 9.2ms | **2.5x** |
-| `((df["a"] + df["b"]) * df["c"] - df["d"]).sum()` | 2.4ms | 5.0ms | **2.1x** |
-| `(df["a"] + df["b"]*df["c"] - df["d"]/df["e"]).sum()` | 3.1ms | 6.1ms | **2.0x** |
-| `df["a"] + df["b"]*df["c"] - df["d"]/df["e"]` | 2.9ms | 4.2ms | **1.5x** |
-| `(df["a"] + df["b"]) * df["c"] - df["d"]` | 2.3ms | 3.1ms | **1.3x** |
+| 8-op fused codegen | 3.0ms | 7.8ms | **2.6x** |
+| `sum(8-op fused)` | 3.9ms | 9.6ms | **2.4x** |
+| `sum((a+b)*c-d)` fused | 2.5ms | 5.3ms | **2.1x** |
+| 5-op fused codegen | 2.6ms | 4.5ms | **1.7x** |
+| codegen cached `(a+b)*c-d` | 2.3ms | 3.4ms | **1.5x** |
+| `(a+b)*c-d` 20M elements | 4.6ms | 6.7ms | **1.5x** |
 
-### Reductions (1.1-2.6x faster)
+### Reductions (1.2-2.3x faster)
 
 | Operation | Metal | Pandas | Speedup |
 |-----------|-------|--------|---------|
-| mean float32 | 1.2ms | 3.2ms | **2.6x** |
-| mean int64 | 1.3ms | 3.4ms | **2.6x** |
-| mean int32 | 1.4ms | 3.4ms | **2.3x** |
-| max float32 | 1.4ms | 2.5ms | **1.8x** |
-| min float32 | 1.4ms | 2.5ms | **1.8x** |
+| mean int32 | 1.6ms | 3.7ms | **2.3x** |
+| mean int64 | 1.7ms | 3.7ms | **2.3x** |
+| mean float32 | 2.4ms | 3.4ms | **1.4x** |
+| max float32 | 2.0ms | 2.8ms | **1.4x** |
+| min float32 | 2.3ms | 2.8ms | **1.2x** |
+
+### GroupBy — High Cardinality (1.4-1.8x faster)
+
+| Operation | Metal | Pandas | Speedup |
+|-----------|-------|--------|---------|
+| groupby sum float32 | 968ms | 1708ms | **1.8x** |
+| groupby min float32 | 967ms | 1693ms | **1.8x** |
+| groupby max float32 | 970ms | 1689ms | **1.7x** |
+| groupby sum int32 | 875ms | 1421ms | **1.6x** |
+| groupby count float32 | 968ms | 1573ms | **1.6x** |
 
 ## Requirements
 

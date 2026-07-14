@@ -31,12 +31,18 @@ def is_metal_available() -> bool:
     return _METAL_AVAILABLE
 
 
-_SUPPORTED_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64)}
+_DATETIME_DTYPE = np.dtype('datetime64[ns]')
+_TIMEDELTA_DTYPE = np.dtype('timedelta64[ns]')
+
+_SUPPORTED_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64),
+                     _DATETIME_DTYPE, _TIMEDELTA_DTYPE}
 
 _FROM_NUMPY = {
     np.dtype('float32'): lambda arr: metaldf_engine.MetalSeries.from_numpy(arr),
     np.dtype('int32'):   lambda arr: metaldf_engine.MetalSeries.from_numpy_i32(arr),
     np.dtype('int64'):   lambda arr: metaldf_engine.MetalSeries.from_numpy_i64(arr),
+    _DATETIME_DTYPE:     lambda arr: metaldf_engine.MetalSeries.from_numpy_datetime(arr.view(np.int64)),
+    _TIMEDELTA_DTYPE:    lambda arr: metaldf_engine.MetalSeries.from_numpy_timedelta(arr.view(np.int64)),
 }
 
 
@@ -61,12 +67,61 @@ def _extract_array(data: Any) -> NDArray:
     return arr
 
 
+def _restore_datetime_dtype(arr: NDArray, original_dtype: np.dtype) -> NDArray:
+    """View a raw int64 GPU result array back as datetime64[ns]/timedelta64[ns]
+    when `original_dtype` was one of those (see ``DType::Datetime`` /
+    ``DType::Timedelta`` -- both are stored as plain int64 on the Rust side,
+    so ``SharedBuffer.to_numpy()`` always hands back an int64 array; callers
+    that echo a Datetime/Timedelta series' *values* back out (e.g. sort,
+    boolean-index compaction) must undo that here so the returned pandas
+    Series' dtype matches what pandas itself would produce). No-op (returns
+    `arr` unchanged) for every other dtype.
+    """
+    if original_dtype == _DATETIME_DTYPE or original_dtype == _TIMEDELTA_DTYPE:
+        return arr.view(original_dtype)
+    return arr
+
+
 def _make_series(arr: NDArray) -> object:
     """Create a Rust MetalSeries from a numpy array with the correct dtype."""
     ctor = _FROM_NUMPY.get(arr.dtype)
     if ctor is None:
         raise MetalNotAvailable(f"Unsupported dtype: {arr.dtype}")
     return ctor(arr)
+
+
+def _make_series_with_nulls(arr: NDArray) -> object:
+    """Create a MetalSeries, detecting NaN as nulls for float32 data.
+
+    ``float32`` is currently the only dtype with a NaN-aware constructor on
+    the Rust side (``MetalSeries.from_numpy_with_nulls`` -- see Task 1.1).
+    When such an array actually contains NaN, build the series through that
+    constructor so the Rust/Metal side carries a validity mask through the
+    kernel. Otherwise (non-float dtypes, or a float32 array with no NaNs at
+    all) fall back to the plain ``_make_series`` constructor -- cheaper, and
+    guaranteed to produce ``null_mask is None`` (see
+    ``tests/test_null_mask.py::test_from_numpy_no_nulls_mask_is_none``).
+    """
+    if arr.dtype == np.dtype(np.float32) and np.any(np.isnan(arr)):
+        return metaldf_engine.MetalSeries.from_numpy_with_nulls(arr)
+    return _make_series(arr)
+
+
+def _result_to_series_with_nulls(result: Any, index: Any = None, name: Any = None) -> pd.Series:
+    """Convert a MetalSeries result to a pandas Series, restoring NaN for nulls.
+
+    If the result carries a null mask (i.e. the op saw at least one null on
+    either operand), the underlying data is upcast to float64 and NaN is
+    written back at every invalid position -- matching pandas' own
+    NaN-propagation semantics for the same operation. Series with no nulls
+    (``result.null_mask is None``) are returned as-is, at their native dtype.
+    """
+    data = result.to_numpy()
+    mask = result.null_mask
+    if mask is not None:
+        data = data.astype(np.float64, copy=True)
+        data[~mask] = np.nan
+    return pd.Series(data, index=index, name=name)
 
 
 def _has_metal() -> bool:
@@ -85,7 +140,8 @@ def _has_metal() -> bool:
 # causing every Metal sort call to raise MetalNotAvailable and fall back to
 # `np.sort`/`np.argsort` (masked by PandasEngine; see _pandas.py). Comparing
 # dtype instances to dtype instances (as done here) hashes consistently.
-_SORT_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64)}
+_SORT_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64),
+                _DATETIME_DTYPE, _TIMEDELTA_DTYPE}
 
 # ---------------------------------------------------------------------------
 # GroupBy kernel dtype support
@@ -112,9 +168,22 @@ def _dispatch_reduction(op_name: str, data: Any) -> Any:
     if data.dtype not in _SUPPORTED_DTYPES:
         raise MetalNotAvailable(f"Unsupported dtype: {data.dtype}")
 
+    # pandas itself raises TypeError for `datetime_series.sum()` ("does not
+    # support operation 'sum'") -- summing nanosecond timestamps isn't a
+    # meaningful quantity. Reject it here (rather than letting it reach the
+    # plain-int64 Metal sum kernel, which would happily add the raw epoch
+    # values) so the caller falls back to pandas and gets that same
+    # TypeError. Timedelta *is* meaningfully summable (pandas returns
+    # another Timedelta), so only Datetime is blocked here.
+    if data.dtype == _DATETIME_DTYPE and op_name == "sum":
+        raise MetalNotAvailable("sum not meaningful for datetime")
+
     arr = _extract_array(data)
-    buf = _make_series(arr)
+    buf = _make_series_with_nulls(arr)
     rust_fn = getattr(metaldf_engine, f"metal_{op_name}")
+    # For an all-null reduction, the Rust kernel itself returns NaN (see
+    # tests/test_null_reductions.py::test_all_nulls_returns_nan and friends)
+    # -- no Python-side wrapping needed, this is already a plain scalar.
     return rust_fn(buf)
 
 
@@ -140,6 +209,93 @@ _ELEMENTWISE_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int
 _TRUEDIV_DTYPES = {np.dtype(np.float32)}
 
 
+# ---------------------------------------------------------------------------
+# Datetime/timedelta binary op type inference
+# ---------------------------------------------------------------------------
+
+# Maps (left_dtype, op_name, right_dtype) -> result_dtype for the six
+# datetime/timedelta arithmetic combinations pandas itself supports. Both
+# Datetime and Timedelta are stored as plain int64 nanoseconds on the Rust
+# side (see DType::Datetime/DType::Timedelta), so the *kernel* dispatched is
+# always the existing binary_add_i64/binary_sub_i64 -- this table only
+# decides which dtype the raw int64 result should be view-cast back to.
+# Combinations pandas itself rejects (e.g. datetime + datetime, timedelta -
+# datetime) are intentionally absent, so `_dispatch_datetime_binary` raises
+# MetalNotAvailable for them and the caller falls back to pandas, which
+# raises the same TypeError pandas raises for those combinations natively.
+_DATETIME_ARITH_RULES = {
+    (_DATETIME_DTYPE, "sub", _DATETIME_DTYPE): _TIMEDELTA_DTYPE,
+    (_DATETIME_DTYPE, "add", _TIMEDELTA_DTYPE): _DATETIME_DTYPE,
+    (_DATETIME_DTYPE, "sub", _TIMEDELTA_DTYPE): _DATETIME_DTYPE,
+    (_TIMEDELTA_DTYPE, "add", _DATETIME_DTYPE): _DATETIME_DTYPE,
+    (_TIMEDELTA_DTYPE, "add", _TIMEDELTA_DTYPE): _TIMEDELTA_DTYPE,
+    (_TIMEDELTA_DTYPE, "sub", _TIMEDELTA_DTYPE): _TIMEDELTA_DTYPE,
+}
+
+
+def _dispatch_datetime_binary(op_name: str, a: Any, b: Any) -> Any:
+    """Dispatch datetime64[ns]/timedelta64[ns] add/sub to the plain int64
+    Metal kernel, then view-cast the raw int64 result back to whichever
+    dtype `_DATETIME_ARITH_RULES` says that combination should produce.
+
+    Mirrors ``_dispatch_binary``'s guards (ProxySeries unwrapping, operand
+    dtype/index checks) but keyed off the datetime arithmetic rule table
+    instead of same-dtype elementwise rules, since here the two operands are
+    deliberately allowed -- required, even -- to differ in dtype (e.g.
+    Datetime - Timedelta = Datetime).
+    """
+    if not _has_metal():
+        raise MetalNotAvailable("Metal not available")
+
+    from metaldf._wrappers import ProxySeries
+    if isinstance(a, ProxySeries) and hasattr(a, "_pandas_obj"):
+        a = a.to_pandas()
+    if isinstance(b, ProxySeries) and hasattr(b, "_pandas_obj"):
+        b = b.to_pandas()
+
+    if not hasattr(a, "dtype") or not hasattr(b, "dtype"):
+        raise MetalNotAvailable("Operands must be pandas Series or numpy arrays")
+
+    result_dtype = _DATETIME_ARITH_RULES.get((a.dtype, op_name, b.dtype))
+    if result_dtype is None:
+        raise MetalNotAvailable(
+            f"Unsupported datetime arithmetic: {a.dtype} {op_name} {b.dtype}"
+        )
+
+    # Same index-alignment guard as _dispatch_binary: Metal zips operands
+    # positionally, so only dispatch when both sides already share an index.
+    a_index = getattr(a, "index", None)
+    b_index = getattr(b, "index", None)
+    if a_index is not None and b_index is not None and not a_index.equals(b_index):
+        raise MetalNotAvailable("Index mismatch requires pandas-side alignment")
+
+    # Both Datetime and Timedelta MetalSeries are DType::Datetime/DType::
+    # Timedelta on the Rust side, not DType::Int64 -- and `metal_binary_op`
+    # rejects both mismatched dtypes (Datetime vs Timedelta, e.g. for
+    # `datetime - timedelta`) *and* Datetime/Timedelta outright, since
+    # `metal_suffix` only maps Float32/Int32/Int64 to a kernel suffix (see
+    # rust/src/kernels/elementwise.rs::metal_suffix). Building both operand
+    # buffers from the plain int64 nanosecond view instead -- via
+    # `from_numpy_i64` rather than `_make_series`'s dtype-based dispatch --
+    # sidesteps both restrictions: the kernel actually dispatched really is
+    # just `binary_add_i64`/`binary_sub_i64`, exactly as the Rust side's own
+    # DType::Datetime/Timedelta doc comments ("uses kernel_suffix = int64")
+    # intend, and the result is view-cast back to the correct
+    # datetime64/timedelta64 dtype below.
+    arr_a = _extract_array(a).view(np.int64)
+    arr_b = _extract_array(b).view(np.int64)
+    buf_a = metaldf_engine.MetalSeries.from_numpy_i64(arr_a)
+    buf_b = metaldf_engine.MetalSeries.from_numpy_i64(arr_b)
+    result = metaldf_engine.metal_binary_op(op_name, buf_a, buf_b)
+
+    result_np = result.to_numpy().view(result_dtype)
+
+    # Same name-inference rule as _dispatch_binary.
+    a_name = getattr(a, "name", None)
+    name = a_name if not hasattr(b, "name") or a_name == b.name else None
+    return pd.Series(result_np, index=a_index, name=name)
+
+
 def _dispatch_binary(op_name: str, a: Any, b: Any) -> Any:
     """Try a Metal elementwise binary op (add/sub/mul/div), raising
     ``MetalNotAvailable`` for any condition Metal can't -- or, for
@@ -157,6 +313,17 @@ def _dispatch_binary(op_name: str, a: Any, b: Any) -> Any:
 
     if not hasattr(a, "dtype") or not hasattr(b, "dtype"):
         raise MetalNotAvailable("Operands must be pandas Series or numpy arrays")
+
+    # Datetime/Timedelta operands need pandas' type-inference rules (e.g.
+    # datetime - datetime = timedelta) applied to the result, not the plain
+    # same-dtype-in-same-dtype-out rule below -- route to the dedicated
+    # dispatcher before the ELEMENTWISE_DTYPES check would otherwise reject
+    # them outright (Datetime/Timedelta aren't elementwise-arithmetic dtypes
+    # in their own right; they're only valid in the specific combinations
+    # `_DATETIME_ARITH_RULES` lists).
+    _dt_dtypes = (_DATETIME_DTYPE, _TIMEDELTA_DTYPE)
+    if a.dtype in _dt_dtypes or b.dtype in _dt_dtypes:
+        return _dispatch_datetime_binary(op_name, a, b)
 
     if a.dtype not in _ELEMENTWISE_DTYPES or b.dtype not in _ELEMENTWISE_DTYPES:
         raise MetalNotAvailable(f"Unsupported dtype: {a.dtype}, {b.dtype}")
@@ -181,8 +348,8 @@ def _dispatch_binary(op_name: str, a: Any, b: Any) -> Any:
 
     arr_a = _extract_array(a)
     arr_b = _extract_array(b)
-    buf_a = _make_series(arr_a)
-    buf_b = _make_series(arr_b)
+    buf_a = _make_series_with_nulls(arr_a)
+    buf_b = _make_series_with_nulls(arr_b)
     result = metaldf_engine.metal_binary_op(op_name, buf_a, buf_b)
 
     # Match pandas' name-inference rule for binary ops: if `b` is also a
@@ -192,7 +359,118 @@ def _dispatch_binary(op_name: str, a: Any, b: Any) -> Any:
     # through unchanged.
     a_name = getattr(a, "name", None)
     name = a_name if not hasattr(b, "name") or a_name == b.name else None
-    return pd.Series(result.to_numpy(), index=a_index, name=name)
+    return _result_to_series_with_nulls(result, index=a_index, name=name)
+
+
+def _dispatch_compact(data: Any, mask: Any) -> Any:
+    """Filter `data` by a parallel boolean `mask` using GPU stream compaction.
+
+    Mirrors ``_dispatch_binary``'s guards: raises ``MetalNotAvailable`` (so
+    the caller falls back to pandas) for unsupported dtypes and for a
+    mismatched index between `data` and `mask` -- ``metal_compact``, like
+    every other Metal kernel here, just zips the two positionally and has
+    no notion of pandas' index-alignment semantics.
+    """
+    if not _has_metal():
+        raise MetalNotAvailable("Metal not available")
+
+    from metaldf._wrappers import ProxySeries
+    if isinstance(data, ProxySeries) and hasattr(data, "_pandas_obj"):
+        data = data.to_pandas()
+    if isinstance(mask, ProxySeries) and hasattr(mask, "_pandas_obj"):
+        mask = mask.to_pandas()
+
+    if not hasattr(data, "dtype") or data.dtype not in _SUPPORTED_DTYPES:
+        raise MetalNotAvailable(f"Unsupported dtype: {getattr(data, 'dtype', type(data))}")
+
+    data_index = getattr(data, "index", None)
+    mask_index = getattr(mask, "index", None)
+    if data_index is not None and mask_index is not None and not data_index.equals(mask_index):
+        raise MetalNotAvailable("Index mismatch requires pandas-side alignment")
+
+    # Convert mask to a Bool-dtype (uint8, values 0/1) numpy array.
+    mask_arr = np.asarray(mask)
+    if mask_arr.dtype == np.dtype(np.bool_):
+        mask_arr = mask_arr.astype(np.uint8)
+    elif mask_arr.dtype != np.dtype(np.uint8):
+        raise MetalNotAvailable(f"Mask must be bool, got {mask_arr.dtype}")
+
+    data_arr = _extract_array(data)
+    data_series = _make_series(data_arr)
+    mask_series = metaldf_engine.MetalSeries.from_numpy_bool(mask_arr)
+
+    result = metaldf_engine.metal_compact(data_series, mask_series)
+
+    # Preserve pandas' index-preserving boolean-indexing semantics: the kept
+    # elements retain their *original* index labels (e.g. filtering
+    # `pd.Series([1,2,3], index=[7,8,9])` down to its last two elements
+    # keeps index [8, 9], not a fresh RangeIndex(0, 2)). The Metal kernel
+    # itself only returns compacted values with no index concept, so the
+    # matching index subset is computed here, cheaply, via plain numpy
+    # boolean-array indexing (no GPU work needed for the index itself).
+    result_index = data_index[mask_arr.astype(bool)] if data_index is not None else None
+    result_arr = _restore_datetime_dtype(result.to_numpy(), data.dtype)
+    return pd.Series(result_arr, index=result_index, name=getattr(data, "name", None))
+
+
+# ---------------------------------------------------------------------------
+# Comparison op dtype support
+# ---------------------------------------------------------------------------
+
+# NOTE: use np.dtype(...) instances, not bare numpy scalar types -- see the
+# _SORT_DTYPES comment above for why comparing dtype instances to bare
+# numpy scalar types silently breaks set/dict membership checks.
+#
+# TODO(datetime): once the parallel "datetime dtype" task lands, Datetime
+# and Timedelta series (both stored as int64 nanoseconds) should also be
+# accepted here and treated as comparable against Int64/each other -- see
+# the equivalent TODO in rust/src/kernels/comparison.rs::cmp_suffix.
+_COMPARE_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64),
+                    _DATETIME_DTYPE, _TIMEDELTA_DTYPE}
+
+
+def _dispatch_compare(op_name: str, a: Any, b: Any) -> Any:
+    """Try a Metal comparison op (eq/ne/lt/le/gt/ge), raising
+    ``MetalNotAvailable`` for any condition Metal can't handle so the
+    caller falls back to pandas. Always returns a bool-dtype Series (the
+    Rust side returns Int32 0/1, converted to bool here).
+    """
+    if not _has_metal():
+        raise MetalNotAvailable("Metal not available")
+
+    from metaldf._wrappers import ProxySeries
+    if isinstance(a, ProxySeries) and hasattr(a, "_pandas_obj"):
+        a = a.to_pandas()
+    if isinstance(b, ProxySeries) and hasattr(b, "_pandas_obj"):
+        b = b.to_pandas()
+
+    if not hasattr(a, "dtype") or not hasattr(b, "dtype"):
+        raise MetalNotAvailable("Operands must be pandas Series or numpy arrays")
+
+    if a.dtype not in _COMPARE_DTYPES or b.dtype not in _COMPARE_DTYPES:
+        raise MetalNotAvailable(f"Comparison not supported for {a.dtype} vs {b.dtype}")
+
+    if a.dtype != b.dtype:
+        raise MetalNotAvailable(f"dtype mismatch: {a.dtype} vs {b.dtype}")
+
+    # Metal has no notion of pandas' index-alignment semantics -- it just
+    # zips positionally. Only dispatch when both operands already share the
+    # same index (the overwhelmingly common case), otherwise fall back to
+    # pandas so alignment (union index, NaN-filling on mismatches) happens.
+    a_index = getattr(a, "index", None)
+    b_index = getattr(b, "index", None)
+    if a_index is not None and b_index is not None and not a_index.equals(b_index):
+        raise MetalNotAvailable("Index mismatch requires pandas-side alignment")
+
+    arr_a = _extract_array(a)
+    arr_b = _extract_array(b)
+    buf_a = _make_series(arr_a)
+    buf_b = _make_series(arr_b)
+    result = metaldf_engine.metal_compare_op(op_name, buf_a, buf_b)
+
+    a_name = getattr(a, "name", None)
+    name = a_name if not hasattr(b, "name") or a_name == b.name else None
+    return pd.Series(result.to_numpy().astype(bool), index=a_index, name=name)
 
 
 def _groupby_dispatch(agg_name: str, keys: Any, values: Any) -> Any:
@@ -334,6 +612,39 @@ class MetalEngine:
     def metal_div(a: Any, b: Any) -> Any:
         return _dispatch_binary("div", a, b)
 
+    # -- Boolean indexing -------------------------------------------------
+
+    @staticmethod
+    def metal_compact(data: Any, mask: Any) -> Any:
+        """Filter `data` by a parallel boolean `mask` using GPU stream compaction."""
+        return _dispatch_compact(data, mask)
+
+    # -- Comparisons ------------------------------------------------------
+
+    @staticmethod
+    def metal_cmp_eq(a: Any, b: Any) -> Any:
+        return _dispatch_compare("eq", a, b)
+
+    @staticmethod
+    def metal_cmp_ne(a: Any, b: Any) -> Any:
+        return _dispatch_compare("ne", a, b)
+
+    @staticmethod
+    def metal_cmp_lt(a: Any, b: Any) -> Any:
+        return _dispatch_compare("lt", a, b)
+
+    @staticmethod
+    def metal_cmp_le(a: Any, b: Any) -> Any:
+        return _dispatch_compare("le", a, b)
+
+    @staticmethod
+    def metal_cmp_gt(a: Any, b: Any) -> Any:
+        return _dispatch_compare("gt", a, b)
+
+    @staticmethod
+    def metal_cmp_ge(a: Any, b: Any) -> Any:
+        return _dispatch_compare("ge", a, b)
+
     # -- Sort -----------------------------------------------------------
 
     @staticmethod
@@ -355,7 +666,8 @@ class MetalEngine:
         arr = _extract_array(data)
         buf = _make_series(arr)
         result_buf = metaldf_engine.metal_sort(buf)
-        return pd.Series(result_buf.to_numpy(), index=data.index, name=getattr(data, "name", None))
+        result_arr = _restore_datetime_dtype(result_buf.to_numpy(), data.dtype)
+        return pd.Series(result_arr, index=data.index, name=getattr(data, "name", None))
 
     @staticmethod
     def metal_argsort(data: Any) -> Any:

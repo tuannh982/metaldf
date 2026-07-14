@@ -12,7 +12,7 @@ import sys
 import types
 from typing import Any
 
-from metaldf._wrappers import ProxyDataFrame, ProxyIndex, ProxySeries
+from metaldf._wrappers import ProxyDataFrame, ProxyIndex, ProxySeries, _wrap_merge
 
 _METALDF_MARKER = "__metaldf_accelerator__"
 
@@ -68,6 +68,9 @@ class _ProxyPandasModule(types.ModuleType):
                     return attr
         except (AttributeError, ValueError):
             pass
+
+        if name == "merge" and callable(attr):
+            return _wrap_merge(attr)
 
         # For functions, wrap their return values
         if callable(attr) and not isinstance(attr, type):
