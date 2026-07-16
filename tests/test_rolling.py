@@ -148,11 +148,12 @@ class TestRollingEdgeCases:
         with pytest.raises(ValueError):
             metaldf_engine.metal_rolling_sum(ms, 0)
 
-    def test_int32_rejected(self):
-        arr = np.array([1, 2, 3], dtype=np.int32)
+    def test_int32_supported(self):
+        arr = np.array([1, 2, 3, 4, 5], dtype=np.int32)
         ms = metaldf_engine.MetalSeries.from_numpy_i32(arr)
-        with pytest.raises(TypeError):
-            metaldf_engine.metal_rolling_sum(ms, 2)
+        result = metaldf_engine.metal_rolling_sum(ms, 2)
+        expected = np.array([1, 3, 5, 7, 9], dtype=np.int32)
+        np.testing.assert_array_equal(result.to_numpy(), expected)
 
     def test_not_a_multiple_of_threadgroup_size(self):
         # THREADGROUP_SIZE is 256 in rust/src/kernels/rolling.rs -- exercise

@@ -38,9 +38,14 @@ const THREADGROUP_SIZE: u64 = 256;
 fn filter_suffix(dtype: DType) -> PyResult<&'static str> {
     match dtype {
         DType::Float32 => Ok("f32"),
+        DType::Int8 => Ok("i8"),
+        DType::Int16 => Ok("i16"),
         DType::Int32 => Ok("i32"),
         DType::Int64 | DType::Datetime | DType::Timedelta => Ok("i64"),
         DType::Uint8 | DType::Bool => Ok("u8"),
+        DType::Uint16 => Ok("u16"),
+        DType::Uint32 => Ok("u32"),
+        DType::Uint64 => Ok("u64"),
         other => Err(pyo3::exceptions::PyTypeError::new_err(format!(
             "compact/take not supported for dtype {:?}", other
         ))),

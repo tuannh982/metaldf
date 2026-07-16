@@ -10,17 +10,17 @@ Last updated: 2026-07-15
 
 | Category | metaldf | pandas | Status |
 |----------|---------|--------|--------|
-| Elementwise arithmetic (add/sub/mul/div/mod) | f32/i32/i64 | Full (+ pow, floordiv, reverse ops) | Partial |
-| Comparisons (eq/ne/lt/le/gt/ge) | f32/i32/i64/datetime/timedelta | Full (+ isin, between, where, mask) | Partial |
-| Reductions: sum/min/max/mean | f32/i32/i64 | Full | Done |
+| Elementwise arithmetic (add/sub/mul/div/mod) | All numeric (f32/i8-i64/u8-u64) | Full (+ pow, floordiv, reverse ops) | Partial |
+| Comparisons (eq/ne/lt/le/gt/ge) | All numeric + datetime/timedelta | Full (+ isin, between, where, mask) | Partial |
+| Reductions: sum/min/max/mean | All numeric (f32/i8-i64/u8-u64) | Full | Done |
 | Reductions: std/var | None | Full | Missing |
 | Reductions: median | None | Full | Missing |
 | Reductions: prod | None | Full | Missing |
 | Reductions: quantile/mode/nunique | None | Full | Missing |
-| Cumulative: cumsum | f32/i32/i64 | Full | Done |
-| Cumulative: cummin/cummax | f32/i32/i64 | Full | Done |
+| Cumulative: cumsum | All numeric (f32/i8-i64/u8-u64) | Full | Done |
+| Cumulative: cummin/cummax | All numeric (f32/i8-i64/u8-u64) | Full | Done |
 | Cumulative: cumprod | None | Full | Missing |
-| Sorting: sort_values/argsort | f32/i32/i64/datetime/timedelta | Full | Done |
+| Sorting: sort_values/argsort | All numeric + datetime/timedelta + bool | Full | Done |
 | Sorting: rank | None | Full | Missing |
 | Sorting: nlargest/nsmallest | None | Full | Missing |
 | GroupBy: sum/mean/min/max/count | f32-f32 or i32-i32 only | Full (all types) | Partial |
@@ -31,7 +31,7 @@ Last updated: 2026-07-15
 | Joins: inner/left/right | f32/i32 keys only | Full | Partial |
 | Joins: outer | None | Full | Missing |
 | Joins: cross | None | Full | Missing |
-| Rolling: sum/mean/min/max/count | f32 only | Full | Partial |
+| Rolling: sum/mean/min/max/count | All numeric types (f32/i8-i64/u8-u64) | Full | Done |
 | Rolling: std/var/median | None | Full | Missing |
 | Rolling: NaN-aware skip | None | Full | Missing |
 | Expanding window | None | Full | Missing |
@@ -47,7 +47,7 @@ Last updated: 2026-07-15
 | Datetime: tz_localize/tz_convert | None | Full | Missing |
 | Datetime: strftime/round/floor/ceil | None | Full | Missing |
 | Datetime arithmetic (+/- timedelta) | Done | Full | Done |
-| Missing data: fillna | f32 scalar | Full | Partial |
+| Missing data: fillna | f32 scalar (NaN), all int types (mask-based) | Full | Partial |
 | Missing data: ffill/bfill | f32 | Full | Partial |
 | Missing data: dropna | None | Full | Missing |
 | Missing data: interpolate | None | Full | Missing |
@@ -66,10 +66,10 @@ Last updated: 2026-07-15
 | Statistical: value_counts | None | Full | Missing |
 | Duplicate handling: drop_duplicates | None | Full | Missing |
 | Duplicate handling: duplicated | None | Full | Missing |
-| Shift/diff/pct_change | f32/i32/i64 | Full | Done |
+| Shift/diff/pct_change | All numeric (f32/i8-i64/u8-u64) | Full | Done |
 | UDF (user-defined functions) | None | apply() | Missing |
 | IO: CSV/Parquet (GPU-accelerated) | None (pandas fallback) | CPU | Missing |
-| Unary math: abs/neg/sqrt/exp/log/ceil/floor | Done | Full | Done |
+| Unary math: abs/neg/sqrt/exp/log/ceil/floor | abs/neg all numeric, transcendentals f32 | Full | Done |
 | Unary math: trig (sin/cos/tan/asin/acos/atan) | Done | Full | Done |
 | Unary math: hyperbolic (sinh/cosh/tanh) | Done | Full | Done |
 | Unary math: log2/log10/round/trunc/cbrt | Done | Full | Done |
@@ -83,17 +83,20 @@ Last updated: 2026-07-15
 |------|-------------|--------|--------|
 | float32 | Full | Full | Done |
 | float64 | Storage only, no GPU ops | Full | Missing |
-| int8/int16 | None | Full | Missing |
-| int32 | Partial (some ops) | Full | Partial |
-| int64 | Partial (no atomics) | Full | Partial |
-| uint8 | String char storage only | Full | Missing |
-| uint32/uint64 | Internal only | Full | Missing |
-| bool | Basic | Full | Partial |
-| datetime64 | Comparisons + dt accessor | Full | Partial |
-| timedelta64 | Comparisons + arithmetic | Full | Partial |
+| int8 | Full (arith, cmp, reduce, sort, scan, filter, shift, rolling) | Full | Done |
+| int16 | Full (arith, cmp, reduce, sort, scan, filter, shift, rolling) | Full | Done |
+| int32 | Full (all ops incl. rolling, fillna w/ mask) | Full | Done |
+| int64 | Full except groupby/join (no 64-bit Metal atomics) | Full | Partial |
+| uint8 | Full (arith, cmp, reduce, sort, scan, filter, shift, rolling) | Full | Done |
+| uint16 | Full (arith, cmp, reduce, sort, scan, filter, shift, rolling) | Full | Done |
+| uint32 | Full (arith, cmp, reduce, sort, scan, filter, shift, rolling) | Full | Done |
+| uint64 | Full (arith, cmp, reduce, sort, scan, filter, shift, rolling) | Full | Done |
+| bool | Logical ops + comparisons + filter + sort | Full | Partial |
+| datetime64 | Comparisons + dt accessor + sort + scan + filter + shift | Full | Partial |
+| timedelta64 | Comparisons + arithmetic + sort + scan + filter + shift | Full | Partial |
 | string (Utf8) | Offsets+chars GPU | Full | Partial |
 | categorical | None | Full | Missing |
-| Nullable integers | None (NaN-as-null f32 only) | Full (pd.Int32Dtype etc) | Missing |
+| Nullable integers | Mask-based fillna for all int types (NaN-as-null f32) | Full (pd.Int32Dtype etc) | Partial |
 
 ## 3. GPU/Metal Architecture Gaps
 

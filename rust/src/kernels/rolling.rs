@@ -9,13 +9,13 @@
 // deferred to a follow-up task — this dispatches the naive kernel
 // unconditionally, regardless of `window` size.
 //
-// f32 only for now (i32 rolling variants are deferred, same as the MSL
-// kernels). `metal_rolling_mean` is a thin wrapper: it reuses the sum kernel
-// then divides by each position's actual in-window count (via the count
-// kernel) rather than a plain GPU `sum / window`, since early positions
-// (before the window is fully filled) have fewer than `window` elements
-// contributing to their sum — matching pandas' default `min_periods=1`
-// behavior.
+// All numeric types supported (f32, i8..i64, u8..u64).
+// `metal_rolling_mean` is a thin wrapper: it reuses the sum kernel then
+// divides by each position's actual in-window count (via the count kernel)
+// rather than a plain GPU `sum / window`, since early positions (before the
+// window is fully filled) have fewer than `window` elements contributing to
+// their sum — matching pandas' default `min_periods=1` behavior.
+// For integer types, mean always returns Float32.
 //
 // Null-masking is NOT handled here: `min_periods` and non-NaN-aware
 // `count()` are left to the Python layer (see Task 7.1 brief / design doc).
@@ -36,10 +36,10 @@ fn num_threadgroups(len: usize) -> u64 {
 
 fn check_rolling_dtype(dtype: DType) -> PyResult<()> {
     match dtype {
-        DType::Float32 => Ok(()),
+        DType::Float32 | DType::Int8 | DType::Int16 | DType::Int32 | DType::Int64
+        | DType::Uint8 | DType::Uint16 | DType::Uint32 | DType::Uint64 => Ok(()),
         _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "Rolling ops not supported for {:?} (only Float32 today)",
-            dtype
+            "Rolling ops not supported for {:?}", dtype
         ))),
     }
 }
@@ -54,7 +54,7 @@ fn check_window(window: usize) -> PyResult<()> {
 }
 
 /// [len, window] packed as two consecutive `uint32_t`s — matches the
-/// `device const uint* params [[buffer(2)]]` layout every `rolling_*_f32`
+/// `device const uint* params [[buffer(2)]]` layout every `rolling_*_{suffix}`
 /// kernel expects (`params[0]` = len, `params[1]` = window).
 fn make_params_buffer(device: &metal::Device, len: usize, window: usize) -> metal::Buffer {
     let params: [u32; 2] = [len as u32, window as u32];
@@ -65,7 +65,7 @@ fn make_params_buffer(device: &metal::Device, len: usize, window: usize) -> meta
     )
 }
 
-/// Dispatches a `rolling_{op}_f32` naive-parallel kernel: one thread per
+/// Dispatches a `rolling_{op}_{suffix}` naive-parallel kernel: one thread per
 /// output element, reading directly from `data`. Shared by
 /// sum/min/max/count.
 fn dispatch_rolling(op_name: &str, data: &SharedBuffer, window: usize) -> PyResult<SharedBuffer> {
@@ -90,7 +90,7 @@ fn dispatch_rolling(op_name: &str, data: &SharedBuffer, window: usize) -> PyResu
 
     let library = load_rolling_library(device)
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-    let kernel_name = format!("rolling_{op_name}_f32");
+    let kernel_name = format!("rolling_{}_{}", op_name, data.dtype.kernel_suffix());
     let pipeline = get_pipeline_state(device, &library, &kernel_name)
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
@@ -110,7 +110,8 @@ fn dispatch_rolling(op_name: &str, data: &SharedBuffer, window: usize) -> PyResu
 
     if cb.status() == metal::MTLCommandBufferStatus::Error {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "rolling_{op_name}_f32 kernel failed: Metal command buffer error"
+            "rolling_{}_{} kernel failed: Metal command buffer error",
+            op_name, data.dtype.kernel_suffix()
         )));
     }
 
@@ -154,9 +155,10 @@ pub fn metal_rolling_count(data: &MetalSeries, window: usize) -> PyResult<MetalS
 
 /// GPU rolling mean: computed as rolling sum divided (elementwise, on CPU —
 /// `len` scalar divisions, negligible next to the two GPU dispatches) by
-/// each position's actual in-window count (from `rolling_count_f32`), not a
-/// flat `window`, so early positions (before the window is fully filled)
-/// match pandas' default `min_periods=1` behavior directly.
+/// each position's actual in-window count (from `rolling_count_{suffix}`),
+/// not a flat `window`, so early positions (before the window is fully
+/// filled) match pandas' default `min_periods=1` behavior directly.
+/// For integer types, mean always returns Float32.
 #[pyfunction]
 pub fn metal_rolling_mean(data: &MetalSeries, window: usize) -> PyResult<MetalSeries> {
     let buf = data.as_numeric_checked()?;
@@ -167,7 +169,14 @@ pub fn metal_rolling_mean(data: &MetalSeries, window: usize) -> PyResult<MetalSe
     let len = buf.len;
 
     if len == 0 {
-        return Ok(MetalSeries::from_numeric(sum_buf));
+        let empty = SharedBuffer::from_metal_buffer(
+            MetalBackend::device()
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("No Metal device"))?
+                .new_buffer(4, MTLResourceOptions::StorageModeShared),
+            0,
+            DType::Float32,
+        );
+        return Ok(MetalSeries::from_numeric(empty));
     }
 
     let count_buf = dispatch_rolling("count", buf, window)?;
@@ -179,13 +188,35 @@ pub fn metal_rolling_mean(data: &MetalSeries, window: usize) -> PyResult<MetalSe
         MTLResourceOptions::StorageModeShared,
     );
 
+    // Read sum values (native dtype), read count values (same dtype as input),
+    // divide to produce f32 output.
     unsafe {
-        let sum_ptr = sum_buf.metal_buffer().contents() as *const f32;
-        let count_ptr = count_buf.metal_buffer().contents() as *const f32;
         let out_ptr = out_buf.contents() as *mut f32;
-        for i in 0..len {
-            let count = *count_ptr.add(i);
-            *out_ptr.add(i) = if count > 0.0 { *sum_ptr.add(i) / count } else { f32::NAN };
+        let count_ptr = count_buf.metal_buffer().contents();
+        let sum_ptr = sum_buf.metal_buffer().contents();
+
+        macro_rules! rolling_mean_div {
+            ($sum_ty:ty, $count_ty:ty) => {{
+                let s = sum_ptr as *const $sum_ty;
+                let c = count_ptr as *const $count_ty;
+                for i in 0..len {
+                    let count = *c.add(i) as f32;
+                    *out_ptr.add(i) = if count > 0.0 { *s.add(i) as f32 / count } else { f32::NAN };
+                }
+            }};
+        }
+
+        match buf.dtype {
+            DType::Float32 => rolling_mean_div!(f32, f32),
+            DType::Int8 => rolling_mean_div!(i8, i8),
+            DType::Int16 => rolling_mean_div!(i16, i16),
+            DType::Int32 => rolling_mean_div!(i32, i32),
+            DType::Int64 => rolling_mean_div!(i64, i64),
+            DType::Uint8 => rolling_mean_div!(u8, u8),
+            DType::Uint16 => rolling_mean_div!(u16, u16),
+            DType::Uint32 => rolling_mean_div!(u32, u32),
+            DType::Uint64 => rolling_mean_div!(u64, u64),
+            _ => unreachable!(),
         }
     }
 

@@ -31,7 +31,9 @@ const BITONIC_MAX_N: usize = 100_000;
 /// bitonic/radix kernels sort them correctly with no MSL changes needed.
 fn validate_sort_buffer(data: &SharedBuffer) -> PyResult<(usize, DType)> {
     match data.dtype {
-        DType::Float32 | DType::Int32 | DType::Int64 | DType::Datetime | DType::Timedelta => Ok((data.len, data.dtype)),
+        DType::Float32 | DType::Int8 | DType::Int16 | DType::Int32 | DType::Int64
+        | DType::Uint8 | DType::Uint16 | DType::Uint32 | DType::Uint64
+        | DType::Bool | DType::Datetime | DType::Timedelta => Ok((data.len, data.dtype)),
         _ => Err(pyo3::exceptions::PyTypeError::new_err(
             format!("Sort not supported for {:?}", data.dtype)
         )),
@@ -54,8 +56,38 @@ fn int32_to_radix_key(i: i32) -> u32 {
 }
 
 #[inline]
+fn int8_to_radix_key(i: i8) -> u8 {
+    (i as u8) ^ 0x80u8
+}
+
+#[inline]
+fn int16_to_radix_key(i: i16) -> u16 {
+    (i as u16) ^ 0x8000u16
+}
+
+#[inline]
 fn int64_to_radix_key(i: i64) -> u64 {
     (i as u64) ^ 0x8000000000000000u64
+}
+
+#[inline]
+fn uint8_to_radix_key(i: u8) -> u8 {
+    i
+}
+
+#[inline]
+fn uint16_to_radix_key(i: u16) -> u16 {
+    i
+}
+
+#[inline]
+fn uint32_to_radix_key(i: u32) -> u32 {
+    i
+}
+
+#[inline]
+fn uint64_to_radix_key(i: u64) -> u64 {
+    i
 }
 
 // ============================================================================
@@ -172,8 +204,14 @@ pub fn run_radix_sort_on_buffers(
 
             match dtype {
                 DType::Float32 => build_histogram!(f32, float_to_radix_key, 0xFFu32),
-                DType::Int32   => build_histogram!(i32, int32_to_radix_key, 0xFFu32),
+                DType::Int8 => build_histogram!(i8, int8_to_radix_key, 0xFFu8),
+                DType::Int16 => build_histogram!(i16, int16_to_radix_key, 0xFFu16),
+                DType::Int32 => build_histogram!(i32, int32_to_radix_key, 0xFFu32),
                 DType::Int64 | DType::Datetime | DType::Timedelta => build_histogram!(i64, int64_to_radix_key, 0xFFu64),
+                DType::Uint8 | DType::Bool => build_histogram!(u8, uint8_to_radix_key, 0xFFu8),
+                DType::Uint16 => build_histogram!(u16, uint16_to_radix_key, 0xFFu16),
+                DType::Uint32 => build_histogram!(u32, uint32_to_radix_key, 0xFFu32),
+                DType::Uint64 => build_histogram!(u64, uint64_to_radix_key, 0xFFu64),
                 _ => unreachable!(),
             }
 
@@ -462,6 +500,18 @@ fn build_null_sentinel_buffer(
                     if !mask.is_valid(i) { *ptr.add(i) = f32::INFINITY; }
                 }
             }
+            DType::Int8 => {
+                let ptr = buf.contents() as *mut i8;
+                for i in 0..len {
+                    if !mask.is_valid(i) { *ptr.add(i) = i8::MAX; }
+                }
+            }
+            DType::Int16 => {
+                let ptr = buf.contents() as *mut i16;
+                for i in 0..len {
+                    if !mask.is_valid(i) { *ptr.add(i) = i16::MAX; }
+                }
+            }
             DType::Int32 => {
                 let ptr = buf.contents() as *mut i32;
                 for i in 0..len {
@@ -474,7 +524,31 @@ fn build_null_sentinel_buffer(
                     if !mask.is_valid(i) { *ptr.add(i) = i64::MAX; }
                 }
             }
-            _ => unreachable!("validate_sort_buffer restricts dtype to Float32/Int32/Int64/Datetime/Timedelta"),
+            DType::Uint8 | DType::Bool => {
+                let ptr = buf.contents() as *mut u8;
+                for i in 0..len {
+                    if !mask.is_valid(i) { *ptr.add(i) = u8::MAX; }
+                }
+            }
+            DType::Uint16 => {
+                let ptr = buf.contents() as *mut u16;
+                for i in 0..len {
+                    if !mask.is_valid(i) { *ptr.add(i) = u16::MAX; }
+                }
+            }
+            DType::Uint32 => {
+                let ptr = buf.contents() as *mut u32;
+                for i in 0..len {
+                    if !mask.is_valid(i) { *ptr.add(i) = u32::MAX; }
+                }
+            }
+            DType::Uint64 => {
+                let ptr = buf.contents() as *mut u64;
+                for i in 0..len {
+                    if !mask.is_valid(i) { *ptr.add(i) = u64::MAX; }
+                }
+            }
+            _ => unreachable!("validate_sort_buffer restricts dtype"),
         }
     }
     SharedBuffer::from_metal_buffer(buf, len, dtype)

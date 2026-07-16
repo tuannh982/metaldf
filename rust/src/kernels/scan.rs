@@ -23,9 +23,9 @@ const SCAN_TG_SIZE: u64 = 256;
 
 fn check_cumulative_dtype(dtype: DType, op: &str) -> PyResult<()> {
     match dtype {
-        DType::Float32 | DType::Int32 | DType::Int64
+        DType::Float32 | DType::Int8 | DType::Int16 | DType::Int32 | DType::Int64
+        | DType::Uint8 | DType::Uint16 | DType::Uint32 | DType::Uint64
         | DType::Datetime | DType::Timedelta => Ok(()),
-        DType::Uint32 if op == "sum" => Ok(()),
         _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
             "Cumulative scan '{}' not supported for {:?}", op, dtype
         ))),
@@ -35,9 +35,14 @@ fn check_cumulative_dtype(dtype: DType, op: &str) -> PyResult<()> {
 fn scan_kernel_suffix(dtype: DType) -> &'static str {
     match dtype {
         DType::Float32 => "float32",
+        DType::Int8 => "int8",
+        DType::Int16 => "int16",
         DType::Int32 => "int32",
         DType::Int64 | DType::Datetime | DType::Timedelta => "int64",
+        DType::Uint8 => "uint8",
+        DType::Uint16 => "uint16",
         DType::Uint32 => "uint32",
+        DType::Uint64 => "uint64",
         _ => unreachable!(),
     }
 }

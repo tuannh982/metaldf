@@ -18,7 +18,10 @@ pub enum DType {
     Float64,
     Int32,
     Int64,
+    Int8,
+    Int16,
     Uint8,
+    Uint16,
     /// Boolean data column (comparison results, logical ops). Stored as one
     /// `uint8_t` per element (0 = false, 1 = true) — NOT packed bits. This is
     /// distinct from `NullMask`, which IS a packed validity bitmask; `Bool`
@@ -31,6 +34,7 @@ pub enum DType {
     /// `Uint32` dtype keeps unsigned-count buffers (e.g. future boolean-mask
     /// scan output consumed by Phase 4 filtering) self-describing.
     Uint32,
+    Uint64,
     /// Datetime column (nanoseconds since 1970-01-01 UTC). Stored as int64.
     /// Uses `kernel_suffix = "int64"` so all int64 kernels work automatically.
     Datetime,
@@ -45,11 +49,15 @@ impl DType {
         match self {
             DType::Float32 => 4,
             DType::Float64 => 8,
+            DType::Int8 => 1,
+            DType::Int16 => 2,
             DType::Int32 => 4,
             DType::Int64 => 8,
             DType::Uint8 => 1,
+            DType::Uint16 => 2,
             DType::Bool => 1,
             DType::Uint32 => 4,
+            DType::Uint64 => 8,
             DType::Datetime => 8,
             DType::Timedelta => 8,
             DType::Utf8 => panic!("Utf8 is a series-level dtype, not a buffer-level dtype"),
@@ -60,11 +68,15 @@ impl DType {
         match self {
             DType::Float32 => "float32",
             DType::Float64 => "float64",
+            DType::Int8 => "int8",
+            DType::Int16 => "int16",
             DType::Int32 => "int32",
             DType::Int64 => "int64",
             DType::Uint8 => "uint8",
+            DType::Uint16 => "uint16",
             DType::Bool => "bool",
             DType::Uint32 => "uint32",
+            DType::Uint64 => "uint64",
             DType::Datetime => "int64",
             DType::Timedelta => "int64",
             DType::Utf8 => panic!("Utf8 has no kernel suffix"),
@@ -73,10 +85,14 @@ impl DType {
 
     pub fn radix_passes(&self) -> u32 {
         match self {
+            DType::Int8 | DType::Uint8 | DType::Bool => 1,
+            DType::Int16 | DType::Uint16 => 2,
             DType::Float32 | DType::Int32 => 4,
+            DType::Uint32 => 4,
             DType::Float64 | DType::Int64 => 8,
+            DType::Uint64 => 8,
             DType::Datetime | DType::Timedelta => 8,
-            _ => panic!("radix_passes not supported for {:?}", self),
+            DType::Utf8 => panic!("radix_passes not supported for {:?}", self),
         }
     }
 
@@ -92,6 +108,14 @@ impl DType {
                 let p = ptr as *mut f64;
                 for i in start..end { *p.add(i) = f64::INFINITY; }
             }
+            DType::Int8 => {
+                let p = ptr as *mut i8;
+                for i in start..end { *p.add(i) = i8::MAX; }
+            }
+            DType::Int16 => {
+                let p = ptr as *mut i16;
+                for i in start..end { *p.add(i) = i16::MAX; }
+            }
             DType::Int32 => {
                 let p = ptr as *mut i32;
                 for i in start..end { *p.add(i) = i32::MAX; }
@@ -100,11 +124,27 @@ impl DType {
                 let p = ptr as *mut i64;
                 for i in start..end { *p.add(i) = i64::MAX; }
             }
+            DType::Uint8 | DType::Bool => {
+                let p = ptr as *mut u8;
+                for i in start..end { *p.add(i) = u8::MAX; }
+            }
+            DType::Uint16 => {
+                let p = ptr as *mut u16;
+                for i in start..end { *p.add(i) = u16::MAX; }
+            }
+            DType::Uint32 => {
+                let p = ptr as *mut u32;
+                for i in start..end { *p.add(i) = u32::MAX; }
+            }
+            DType::Uint64 => {
+                let p = ptr as *mut u64;
+                for i in start..end { *p.add(i) = u64::MAX; }
+            }
             DType::Datetime | DType::Timedelta => {
                 let p = ptr as *mut i64;
                 for i in start..end { *p.add(i) = i64::MAX; }
             }
-            _ => panic!("fill_max not supported for {:?}", self),
+            DType::Utf8 => panic!("fill_max not supported for {:?}", self),
         }
     }
 }
@@ -196,17 +236,52 @@ impl SharedBuffer {
         from_numpy_inner(s.as_ptr() as *const u8, s.len(), s.len(), DType::Bool)
     }
 
+    pub fn from_numpy_i8(data: &Bound<PyArray1<i8>>) -> PyResult<SharedBuffer> {
+        let r = data.readonly();
+        let s = r.as_slice().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("numpy: {e}")))?;
+        from_numpy_inner(s.as_ptr() as *const u8, s.len(), s.len(), DType::Int8)
+    }
+
+    pub fn from_numpy_i16(data: &Bound<PyArray1<i16>>) -> PyResult<SharedBuffer> {
+        let r = data.readonly();
+        let s = r.as_slice().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("numpy: {e}")))?;
+        from_numpy_inner(s.as_ptr() as *const u8, s.len() * 2, s.len(), DType::Int16)
+    }
+
+    pub fn from_numpy_u8(data: &Bound<PyArray1<u8>>) -> PyResult<SharedBuffer> {
+        let r = data.readonly();
+        let s = r.as_slice().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("numpy: {e}")))?;
+        from_numpy_inner(s.as_ptr() as *const u8, s.len(), s.len(), DType::Uint8)
+    }
+
+    pub fn from_numpy_u16(data: &Bound<PyArray1<u16>>) -> PyResult<SharedBuffer> {
+        let r = data.readonly();
+        let s = r.as_slice().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("numpy: {e}")))?;
+        from_numpy_inner(s.as_ptr() as *const u8, s.len() * 2, s.len(), DType::Uint16)
+    }
+
+    pub fn from_numpy_u64(data: &Bound<PyArray1<u64>>) -> PyResult<SharedBuffer> {
+        let r = data.readonly();
+        let s = r.as_slice().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("numpy: {e}")))?;
+        from_numpy_inner(s.as_ptr() as *const u8, s.len() * 8, s.len(), DType::Uint64)
+    }
+
     pub fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         match self.dtype {
             DType::Float32 => impl_to_numpy_arm!(self, py, f32),
             DType::Float64 => impl_to_numpy_arm!(self, py, f64),
+            DType::Int8    => impl_to_numpy_arm!(self, py, i8),
+            DType::Int16   => impl_to_numpy_arm!(self, py, i16),
             DType::Int32   => impl_to_numpy_arm!(self, py, i32),
             DType::Int64   => impl_to_numpy_arm!(self, py, i64),
+            DType::Uint8   => impl_to_numpy_arm!(self, py, u8),
+            DType::Uint16  => impl_to_numpy_arm!(self, py, u16),
             DType::Bool    => impl_to_numpy_arm!(self, py, u8),
             DType::Uint32  => impl_to_numpy_arm!(self, py, u32),
+            DType::Uint64  => impl_to_numpy_arm!(self, py, u64),
             DType::Datetime  => impl_to_numpy_arm!(self, py, i64),
             DType::Timedelta => impl_to_numpy_arm!(self, py, i64),
-            _ => Err(pyo3::exceptions::PyTypeError::new_err(
+            DType::Utf8 => Err(pyo3::exceptions::PyTypeError::new_err(
                 format!("to_numpy not supported for {:?}", self.dtype)
             )),
         }

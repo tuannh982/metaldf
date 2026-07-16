@@ -119,8 +119,14 @@ fn read_scalar(py: Python, buffer: &metal::Buffer, dtype: DType) -> PyResult<PyO
     unsafe {
         match dtype {
             DType::Float32 => Ok((*(buffer.contents() as *const f32)).into_py(py)),
+            DType::Int8 => Ok((*(buffer.contents() as *const i8)).into_py(py)),
+            DType::Int16 => Ok((*(buffer.contents() as *const i16)).into_py(py)),
             DType::Int32 => Ok((*(buffer.contents() as *const i32)).into_py(py)),
             DType::Int64 | DType::Datetime | DType::Timedelta => Ok((*(buffer.contents() as *const i64)).into_py(py)),
+            DType::Uint8 => Ok((*(buffer.contents() as *const u8)).into_py(py)),
+            DType::Uint16 => Ok((*(buffer.contents() as *const u16)).into_py(py)),
+            DType::Uint32 => Ok((*(buffer.contents() as *const u32)).into_py(py)),
+            DType::Uint64 => Ok((*(buffer.contents() as *const u64)).into_py(py)),
             _ => Err(pyo3::exceptions::PyTypeError::new_err(
                 format!("Reduction not supported for {:?}", dtype)
             )),
@@ -145,7 +151,9 @@ fn dispatch_reduction(
 ) -> PyResult<PyObject> {
     let dtype = data.dtype;
     match dtype {
-        DType::Float32 | DType::Int32 | DType::Int64 | DType::Datetime | DType::Timedelta => {}
+        DType::Float32 | DType::Int8 | DType::Int16 | DType::Int32 | DType::Int64
+        | DType::Uint8 | DType::Uint16 | DType::Uint32 | DType::Uint64
+        | DType::Datetime | DType::Timedelta => {}
         _ => return Err(pyo3::exceptions::PyTypeError::new_err(
             format!("Reduction not supported for {:?}", dtype)
         )),
@@ -216,12 +224,13 @@ fn dispatch_reduction(
 #[pyfunction]
 pub fn metal_sum(py: Python, data: &MetalSeries) -> PyResult<PyObject> {
     let buf = data.as_numeric_checked()?;
-    // The int32 widening-sum path (below) doesn't consult a null mask yet —
-    // `from_numpy_with_nulls` only builds masks for float32 today, so int32
-    // null-aware sum is deferred (see task-1.3 brief).
-    if buf.dtype == DType::Int32 {
-        let sum = dispatch_widening_sum_int32(buf)?;
-        return Ok(sum.into_py(py));
+    match buf.dtype {
+        DType::Int8 | DType::Int16 | DType::Int32
+        | DType::Uint8 | DType::Uint16 => {
+            let sum = dispatch_widening_sum(buf)?;
+            return Ok(sum.into_py(py));
+        }
+        _ => {}
     }
     dispatch_reduction(py, "sum", buf, data.null_mask.as_ref())
 }
@@ -236,10 +245,11 @@ pub fn metal_max(py: Python, data: &MetalSeries) -> PyResult<PyObject> {
     dispatch_reduction(py, "max", data.as_numeric_checked()?, data.null_mask.as_ref())
 }
 
-/// GPU widening sum: first pass reads int32, accumulates as int64 via
-/// reduce_widen_sum_int32. Subsequent passes reduce int64 partials via
-/// reduce_int64_sum. Avoids int32 overflow while staying fully on GPU.
-fn dispatch_widening_sum_int32(data: &SharedBuffer) -> PyResult<i64> {
+/// GPU widening sum: first pass reads narrow integers (8/16/32-bit), accumulates
+/// as int64 via `reduce_widen_sum_{kernel_suffix}`. Subsequent passes reduce
+/// int64 partials via `reduce_int64_sum`. Avoids overflow while staying fully
+/// on GPU.
+fn dispatch_widening_sum(data: &SharedBuffer) -> PyResult<i64> {
     let (device, queue) = MetalBackend::device_and_queue()?;
     let library = load_reductions_library(device)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
@@ -247,7 +257,8 @@ fn dispatch_widening_sum_int32(data: &SharedBuffer) -> PyResult<i64> {
     let len = data.len as u64;
     let num_groups = num_threadgroups(len);
 
-    let widen_pl = get_pipeline_state(device, &library, "reduce_widen_sum_int32")
+    let widen_name = format!("reduce_widen_sum_{}", data.dtype.kernel_suffix());
+    let widen_pl = get_pipeline_state(device, &library, &widen_name)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
     let partials = device.new_buffer(num_groups * 8, MTLResourceOptions::StorageModeShared);
     dispatch_reduce_pass(device, queue, &widen_pl, data.metal_buffer(), &partials, len, 8)?;
@@ -288,7 +299,9 @@ pub fn metal_mean(py: Python, data: &MetalSeries) -> PyResult<PyObject> {
     }
 
     let sum: f64 = match buf.dtype {
-        DType::Int32 => dispatch_widening_sum_int32(buf)? as f64,
+        DType::Int8 | DType::Int16 | DType::Int32 | DType::Uint8 | DType::Uint16 => {
+            dispatch_widening_sum(buf)? as f64
+        }
         _ => {
             let sum_obj = dispatch_reduction(py, "sum", buf, None)?;
             sum_obj.extract(py)?

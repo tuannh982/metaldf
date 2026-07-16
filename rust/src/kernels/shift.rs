@@ -11,8 +11,14 @@ const THREADGROUP_SIZE: u64 = 256;
 fn shift_suffix(dtype: DType) -> PyResult<&'static str> {
     match dtype {
         DType::Float32 => Ok("float32"),
+        DType::Int8 => Ok("int8"),
+        DType::Int16 => Ok("int16"),
         DType::Int32 => Ok("int32"),
         DType::Int64 | DType::Datetime | DType::Timedelta => Ok("int64"),
+        DType::Uint8 => Ok("uint8"),
+        DType::Uint16 => Ok("uint16"),
+        DType::Uint32 => Ok("uint32"),
+        DType::Uint64 => Ok("uint64"),
         _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
             "shift not supported for {:?}", dtype
         ))),

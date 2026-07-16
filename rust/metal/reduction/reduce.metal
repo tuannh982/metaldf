@@ -240,6 +240,36 @@ INSTANTIATE_REDUCE_TREE(long, int64_sum, SumOp)
 INSTANTIATE_REDUCE_TREE(long, int64_min, MinOp)
 INSTANTIATE_REDUCE_TREE(long, int64_max, MaxOp)
 
+// uint32 (32-bit, SIMD works)
+INSTANTIATE_REDUCE(uint, uint32_sum, SumOp)
+INSTANTIATE_REDUCE(uint, uint32_min, MinOp)
+INSTANTIATE_REDUCE(uint, uint32_max, MaxOp)
+
+// int8 (8-bit, no SIMD -- use tree)
+INSTANTIATE_REDUCE_TREE(char, int8_sum, SumOp)
+INSTANTIATE_REDUCE_TREE(char, int8_min, MinOp)
+INSTANTIATE_REDUCE_TREE(char, int8_max, MaxOp)
+
+// int16 (16-bit, no SIMD -- use tree)
+INSTANTIATE_REDUCE_TREE(short, int16_sum, SumOp)
+INSTANTIATE_REDUCE_TREE(short, int16_min, MinOp)
+INSTANTIATE_REDUCE_TREE(short, int16_max, MaxOp)
+
+// uint8 (8-bit, no SIMD -- use tree)
+INSTANTIATE_REDUCE_TREE(uchar, uint8_sum, SumOp)
+INSTANTIATE_REDUCE_TREE(uchar, uint8_min, MinOp)
+INSTANTIATE_REDUCE_TREE(uchar, uint8_max, MaxOp)
+
+// uint16 (16-bit, no SIMD -- use tree)
+INSTANTIATE_REDUCE_TREE(ushort, uint16_sum, SumOp)
+INSTANTIATE_REDUCE_TREE(ushort, uint16_min, MinOp)
+INSTANTIATE_REDUCE_TREE(ushort, uint16_max, MaxOp)
+
+// uint64 (64-bit, no SIMD -- use tree)
+INSTANTIATE_REDUCE_TREE(ulong, uint64_sum, SumOp)
+INSTANTIATE_REDUCE_TREE(ulong, uint64_min, MinOp)
+INSTANTIATE_REDUCE_TREE(ulong, uint64_max, MaxOp)
+
 INSTANTIATE_REDUCE_MASKED(float, float32_sum, SumOp)
 INSTANTIATE_REDUCE_MASKED(float, float32_min, MinOp)
 INSTANTIATE_REDUCE_MASKED(float, float32_max, MaxOp)
@@ -251,6 +281,30 @@ INSTANTIATE_REDUCE_MASKED(int, int32_max, MaxOp)
 INSTANTIATE_REDUCE_TREE_MASKED(long, int64_sum, SumOp)
 INSTANTIATE_REDUCE_TREE_MASKED(long, int64_min, MinOp)
 INSTANTIATE_REDUCE_TREE_MASKED(long, int64_max, MaxOp)
+
+INSTANTIATE_REDUCE_MASKED(uint, uint32_sum, SumOp)
+INSTANTIATE_REDUCE_MASKED(uint, uint32_min, MinOp)
+INSTANTIATE_REDUCE_MASKED(uint, uint32_max, MaxOp)
+
+INSTANTIATE_REDUCE_TREE_MASKED(char, int8_sum, SumOp)
+INSTANTIATE_REDUCE_TREE_MASKED(char, int8_min, MinOp)
+INSTANTIATE_REDUCE_TREE_MASKED(char, int8_max, MaxOp)
+
+INSTANTIATE_REDUCE_TREE_MASKED(short, int16_sum, SumOp)
+INSTANTIATE_REDUCE_TREE_MASKED(short, int16_min, MinOp)
+INSTANTIATE_REDUCE_TREE_MASKED(short, int16_max, MaxOp)
+
+INSTANTIATE_REDUCE_TREE_MASKED(uchar, uint8_sum, SumOp)
+INSTANTIATE_REDUCE_TREE_MASKED(uchar, uint8_min, MinOp)
+INSTANTIATE_REDUCE_TREE_MASKED(uchar, uint8_max, MaxOp)
+
+INSTANTIATE_REDUCE_TREE_MASKED(ushort, uint16_sum, SumOp)
+INSTANTIATE_REDUCE_TREE_MASKED(ushort, uint16_min, MinOp)
+INSTANTIATE_REDUCE_TREE_MASKED(ushort, uint16_max, MaxOp)
+
+INSTANTIATE_REDUCE_TREE_MASKED(ulong, uint64_sum, SumOp)
+INSTANTIATE_REDUCE_TREE_MASKED(ulong, uint64_min, MinOp)
+INSTANTIATE_REDUCE_TREE_MASKED(ulong, uint64_max, MaxOp)
 
 // Widening sum: reads narrow input T, accumulates as int64 to avoid overflow.
 // Used by metal_mean for integer types. First pass widens, subsequent passes
@@ -292,3 +346,7 @@ void reduce_widen_sum_impl(
     ) { reduce_widen_sum_impl<T>(input, output, shared, tid, group_id, group_size, len_ptr); }
 
 INSTANTIATE_REDUCE_WIDEN_SUM(int, int32)
+INSTANTIATE_REDUCE_WIDEN_SUM(char, int8)
+INSTANTIATE_REDUCE_WIDEN_SUM(short, int16)
+INSTANTIATE_REDUCE_WIDEN_SUM(uchar, uint8)
+INSTANTIATE_REDUCE_WIDEN_SUM(ushort, uint16)

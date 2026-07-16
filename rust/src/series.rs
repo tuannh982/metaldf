@@ -125,6 +125,46 @@ impl MetalSeries {
         Ok(MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype: DType::Bool, null_mask: None })
     }
 
+    #[staticmethod]
+    pub fn from_numpy_i8(data: &Bound<PyArray1<i8>>) -> PyResult<MetalSeries> {
+        let buf = SharedBuffer::from_numpy_i8(data)?;
+        let len = buf.len;
+        let column = MetalColumn::from_buffer(buf.metal_buffer().clone(), len, DType::Int8);
+        Ok(MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype: DType::Int8, null_mask: None })
+    }
+
+    #[staticmethod]
+    pub fn from_numpy_i16(data: &Bound<PyArray1<i16>>) -> PyResult<MetalSeries> {
+        let buf = SharedBuffer::from_numpy_i16(data)?;
+        let len = buf.len;
+        let column = MetalColumn::from_buffer(buf.metal_buffer().clone(), len, DType::Int16);
+        Ok(MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype: DType::Int16, null_mask: None })
+    }
+
+    #[staticmethod]
+    pub fn from_numpy_u8(data: &Bound<PyArray1<u8>>) -> PyResult<MetalSeries> {
+        let buf = SharedBuffer::from_numpy_u8(data)?;
+        let len = buf.len;
+        let column = MetalColumn::from_buffer(buf.metal_buffer().clone(), len, DType::Uint8);
+        Ok(MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype: DType::Uint8, null_mask: None })
+    }
+
+    #[staticmethod]
+    pub fn from_numpy_u16(data: &Bound<PyArray1<u16>>) -> PyResult<MetalSeries> {
+        let buf = SharedBuffer::from_numpy_u16(data)?;
+        let len = buf.len;
+        let column = MetalColumn::from_buffer(buf.metal_buffer().clone(), len, DType::Uint16);
+        Ok(MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype: DType::Uint16, null_mask: None })
+    }
+
+    #[staticmethod]
+    pub fn from_numpy_u64(data: &Bound<PyArray1<u64>>) -> PyResult<MetalSeries> {
+        let buf = SharedBuffer::from_numpy_u64(data)?;
+        let len = buf.len;
+        let column = MetalColumn::from_buffer(buf.metal_buffer().clone(), len, DType::Uint64);
+        Ok(MetalSeries { column, data: SeriesData::Numeric(buf), len, dtype: DType::Uint64, null_mask: None })
+    }
+
     /// Build a `MetalSeries` from a float32 numpy array, treating NaN values
     /// as nulls: a validity bitmask (`NullMask`) is built marking each NaN
     /// position invalid, and the underlying GPU buffer stores `0.0` in place

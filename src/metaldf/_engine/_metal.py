@@ -34,13 +34,22 @@ def is_metal_available() -> bool:
 _DATETIME_DTYPE = np.dtype('datetime64[ns]')
 _TIMEDELTA_DTYPE = np.dtype('timedelta64[ns]')
 
-_SUPPORTED_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64),
+_SUPPORTED_DTYPES = {np.dtype(np.float32), np.dtype(np.int8), np.dtype(np.int16),
+                     np.dtype(np.int32), np.dtype(np.int64),
+                     np.dtype(np.uint8), np.dtype(np.uint16),
+                     np.dtype(np.uint32), np.dtype(np.uint64),
                      _DATETIME_DTYPE, _TIMEDELTA_DTYPE}
 
 _FROM_NUMPY = {
     np.dtype('float32'): lambda arr: metaldf_engine.MetalSeries.from_numpy(arr),
+    np.dtype('int8'):    lambda arr: metaldf_engine.MetalSeries.from_numpy_i8(arr),
+    np.dtype('int16'):   lambda arr: metaldf_engine.MetalSeries.from_numpy_i16(arr),
     np.dtype('int32'):   lambda arr: metaldf_engine.MetalSeries.from_numpy_i32(arr),
     np.dtype('int64'):   lambda arr: metaldf_engine.MetalSeries.from_numpy_i64(arr),
+    np.dtype('uint8'):   lambda arr: metaldf_engine.MetalSeries.from_numpy_u8(arr),
+    np.dtype('uint16'):  lambda arr: metaldf_engine.MetalSeries.from_numpy_u16(arr),
+    np.dtype('uint32'):  lambda arr: metaldf_engine.MetalSeries.from_numpy_u32(arr),
+    np.dtype('uint64'):  lambda arr: metaldf_engine.MetalSeries.from_numpy_u64(arr),
     _DATETIME_DTYPE:     lambda arr: metaldf_engine.MetalSeries.from_numpy_datetime(arr.view(np.int64)),
     _TIMEDELTA_DTYPE:    lambda arr: metaldf_engine.MetalSeries.from_numpy_timedelta(arr.view(np.int64)),
 }
@@ -140,7 +149,10 @@ def _has_metal() -> bool:
 # causing every Metal sort call to raise MetalNotAvailable and fall back to
 # `np.sort`/`np.argsort` (masked by PandasEngine; see _pandas.py). Comparing
 # dtype instances to dtype instances (as done here) hashes consistently.
-_SORT_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64),
+_SORT_DTYPES = {np.dtype(np.float32), np.dtype(np.int8), np.dtype(np.int16),
+                np.dtype(np.int32), np.dtype(np.int64),
+                np.dtype(np.uint8), np.dtype(np.uint16),
+                np.dtype(np.uint32), np.dtype(np.uint64),
                 _DATETIME_DTYPE, _TIMEDELTA_DTYPE}
 
 # ---------------------------------------------------------------------------
@@ -194,7 +206,10 @@ def _dispatch_reduction(op_name: str, data: Any) -> Any:
 # NOTE: use np.dtype(...) instances, not bare numpy scalar types -- see the
 # _SORT_DTYPES comment above for why comparing dtype instances to bare
 # numpy scalar types silently breaks set/dict membership checks.
-_CUMULATIVE_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64),
+_CUMULATIVE_DTYPES = {np.dtype(np.float32), np.dtype(np.int8), np.dtype(np.int16),
+                      np.dtype(np.int32), np.dtype(np.int64),
+                      np.dtype(np.uint8), np.dtype(np.uint16),
+                      np.dtype(np.uint32), np.dtype(np.uint64),
                       _DATETIME_DTYPE, _TIMEDELTA_DTYPE}
 
 
@@ -349,7 +364,10 @@ def _dispatch_bfill(data: Any) -> Any:
 # NOTE: use np.dtype(...) instances, not bare numpy scalar types -- see the
 # _SORT_DTYPES comment above for why comparing dtype instances to bare
 # numpy scalar types silently breaks set/dict membership checks.
-_ELEMENTWISE_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64)}
+_ELEMENTWISE_DTYPES = {np.dtype(np.float32), np.dtype(np.int8), np.dtype(np.int16),
+                       np.dtype(np.int32), np.dtype(np.int64),
+                       np.dtype(np.uint8), np.dtype(np.uint16),
+                       np.dtype(np.uint32), np.dtype(np.uint64)}
 
 # pandas' true division (`/` / `__truediv__`) always promotes int Series to
 # float64 (e.g. 10 / 3 == 3.333...). The Metal `div` kernel does same-dtype
@@ -579,8 +597,11 @@ def _dispatch_compact(data: Any, mask: Any) -> Any:
 # and Timedelta series (both stored as int64 nanoseconds) should also be
 # accepted here and treated as comparable against Int64/each other -- see
 # the equivalent TODO in rust/src/kernels/comparison.rs::cmp_suffix.
-_COMPARE_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64),
-                    _DATETIME_DTYPE, _TIMEDELTA_DTYPE}
+_COMPARE_DTYPES = {np.dtype(np.float32), np.dtype(np.int8), np.dtype(np.int16),
+                   np.dtype(np.int32), np.dtype(np.int64),
+                   np.dtype(np.uint8), np.dtype(np.uint16),
+                   np.dtype(np.uint32), np.dtype(np.uint64),
+                   _DATETIME_DTYPE, _TIMEDELTA_DTYPE}
 
 
 def _dispatch_compare(op_name: str, a: Any, b: Any) -> Any:

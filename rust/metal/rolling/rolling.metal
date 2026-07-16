@@ -98,3 +98,140 @@ kernel void rolling_count_f32(
     uint start = (idx + 1 >= window) ? (idx + 1 - window) : 0;
     output[idx] = float(idx - start + 1);
 }
+
+// --- Templated rolling kernels for integer types ---
+// No NaN handling needed: every element is valid, count is always
+// min(idx+1, window).
+
+template <typename T>
+void rolling_sum_impl(
+    device const T* data,
+    device T* output,
+    device const uint* params,
+    uint idx
+) {
+    uint len = params[0];
+    uint window = params[1];
+    if (idx >= len) return;
+
+    uint start = (idx + 1 >= window) ? (idx + 1 - window) : 0;
+    T sum = T(0);
+    for (uint i = start; i <= idx; i++) {
+        sum += data[i];
+    }
+    output[idx] = sum;
+}
+
+template <typename T>
+void rolling_min_impl(
+    device const T* data,
+    device T* output,
+    device const uint* params,
+    uint idx
+) {
+    uint len = params[0];
+    uint window = params[1];
+    if (idx >= len) return;
+
+    uint start = (idx + 1 >= window) ? (idx + 1 - window) : 0;
+    T val = data[start];
+    for (uint i = start + 1; i <= idx; i++) {
+        val = min(val, data[i]);
+    }
+    output[idx] = val;
+}
+
+template <typename T>
+void rolling_max_impl(
+    device const T* data,
+    device T* output,
+    device const uint* params,
+    uint idx
+) {
+    uint len = params[0];
+    uint window = params[1];
+    if (idx >= len) return;
+
+    uint start = (idx + 1 >= window) ? (idx + 1 - window) : 0;
+    T val = data[start];
+    for (uint i = start + 1; i <= idx; i++) {
+        val = max(val, data[i]);
+    }
+    output[idx] = val;
+}
+
+// Count for integer types outputs uint (number of elements in window).
+template <typename T>
+void rolling_count_impl(
+    device const T* data,
+    device uint* output,
+    device const uint* params,
+    uint idx
+) {
+    uint len = params[0];
+    uint window = params[1];
+    if (idx >= len) return;
+
+    uint start = (idx + 1 >= window) ? (idx + 1 - window) : 0;
+    output[idx] = idx - start + 1;
+}
+
+#define INSTANTIATE_ROLLING(T, suffix) \
+    kernel void rolling_sum_##suffix( \
+        device const T* data   [[buffer(0)]], \
+        device T* output       [[buffer(1)]], \
+        device const uint* params [[buffer(2)]], \
+        uint idx [[thread_position_in_grid]] \
+    ) { rolling_sum_impl<T>(data, output, params, idx); } \
+    kernel void rolling_min_##suffix( \
+        device const T* data   [[buffer(0)]], \
+        device T* output       [[buffer(1)]], \
+        device const uint* params [[buffer(2)]], \
+        uint idx [[thread_position_in_grid]] \
+    ) { rolling_min_impl<T>(data, output, params, idx); } \
+    kernel void rolling_max_##suffix( \
+        device const T* data   [[buffer(0)]], \
+        device T* output       [[buffer(1)]], \
+        device const uint* params [[buffer(2)]], \
+        uint idx [[thread_position_in_grid]] \
+    ) { rolling_max_impl<T>(data, output, params, idx); }
+
+INSTANTIATE_ROLLING(int,    int32)
+INSTANTIATE_ROLLING(long,   int64)
+INSTANTIATE_ROLLING(uint,   uint32)
+INSTANTIATE_ROLLING(char,   int8)
+INSTANTIATE_ROLLING(short,  int16)
+INSTANTIATE_ROLLING(uchar,  uint8)
+INSTANTIATE_ROLLING(ushort, uint16)
+INSTANTIATE_ROLLING(ulong,  uint64)
+
+// float32 aliases: the original hand-written kernels above use the `_f32`
+// suffix, but the Rust dispatcher now uses `kernel_suffix()` which returns
+// `"float32"`. Add aliases so both names resolve.
+INSTANTIATE_ROLLING(float, float32)
+
+// Count kernels for integer types (output is always the same type T,
+// storing min(idx+1, window) as an integer count).
+#define INSTANTIATE_ROLLING_COUNT(T, suffix) \
+    kernel void rolling_count_##suffix( \
+        device const T* data   [[buffer(0)]], \
+        device T* output       [[buffer(1)]], \
+        device const uint* params [[buffer(2)]], \
+        uint idx [[thread_position_in_grid]] \
+    ) { \
+        uint len = params[0]; \
+        uint window = params[1]; \
+        if (idx >= len) return; \
+        uint start = (idx + 1 >= window) ? (idx + 1 - window) : 0; \
+        output[idx] = T(idx - start + 1); \
+    }
+
+INSTANTIATE_ROLLING_COUNT(float, float32)
+INSTANTIATE_ROLLING_COUNT(int,    int32)
+INSTANTIATE_ROLLING_COUNT(long,   int64)
+INSTANTIATE_ROLLING_COUNT(uint,   uint32)
+INSTANTIATE_ROLLING_COUNT(char,   int8)
+INSTANTIATE_ROLLING_COUNT(short,  int16)
+INSTANTIATE_ROLLING_COUNT(uchar,  uint8)
+INSTANTIATE_ROLLING_COUNT(ushort, uint16)
+INSTANTIATE_ROLLING_COUNT(ulong,  uint64)
