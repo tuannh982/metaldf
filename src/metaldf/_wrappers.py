@@ -807,6 +807,22 @@ class ProxySeries(pd.Series, metaclass=_ProxyMeta):
                 return self._try_metal_unary(op_name, ufunc)
         return pd.Series.__array_ufunc__(self, ufunc, method, *inputs, **kwargs)
 
+    def _try_metal_series_op(self, op_name: str, *args: Any, **kwargs: Any) -> Any:
+        """Try Metal path for a series-returning operation, fall back to pandas."""
+        from metaldf._engine import execute
+        from metaldf._wrappers import _wrap_result
+        from metaldf.exceptions import MetalNotAvailable
+
+        try:
+            result = execute(op_name, self._pandas_obj, *args, **kwargs)
+            return _wrap_result(result)
+        except (MetalNotAvailable, Exception):
+            pandas_method = getattr(pd.Series, op_name, None)
+            if pandas_method is None:
+                raise AttributeError(f"'{type(self).__name__}' has no attribute '{op_name}'")
+            result = pandas_method(self._pandas_obj, *args, **kwargs)
+            return _wrap_result(result)
+
     def _try_metal_reduction(self, op_name: str, *args: Any, **kwargs: Any) -> Any:
         """Try Metal path for a reduction operation, fall back to pandas.
 
@@ -845,6 +861,73 @@ class ProxySeries(pd.Series, metaclass=_ProxyMeta):
 
     def mean(self, *args: Any, **kwargs: Any) -> Any:
         return self._try_metal_reduction("mean", *args, **kwargs)
+
+    def cumsum(self, *args: Any, **kwargs: Any) -> Any:
+        return self._try_metal_series_op("cumsum", *args, **kwargs)
+
+    def cummin(self, *args: Any, **kwargs: Any) -> Any:
+        return self._try_metal_series_op("cummin", *args, **kwargs)
+
+    def cummax(self, *args: Any, **kwargs: Any) -> Any:
+        return self._try_metal_series_op("cummax", *args, **kwargs)
+
+    def shift(self, periods: int = 1, **kwargs: Any) -> Any:
+        return self._try_metal_series_op("shift", periods=periods)
+
+    def diff(self, periods: int = 1, **kwargs: Any) -> Any:
+        from metaldf._wrappers import _wrap_result
+        try:
+            shifted = self.shift(periods)
+            return self - shifted
+        except Exception:
+            result = pd.Series.diff(self._pandas_obj, periods=periods, **kwargs)
+            return _wrap_result(result)
+
+    def pct_change(self, periods: int = 1, **kwargs: Any) -> Any:
+        from metaldf._wrappers import _wrap_result
+        try:
+            shifted = self.shift(periods)
+            return (self - shifted) / shifted
+        except Exception:
+            result = pd.Series.pct_change(self._pandas_obj, periods=periods, **kwargs)
+            return _wrap_result(result)
+
+    def fillna(self, value: Any = None, **kwargs: Any) -> Any:
+        """Fill NaN values, trying Metal for a scalar float32 fill.
+
+        Reads off ``self`` directly (not ``self._pandas_obj``) rather than
+        going through ``_try_metal_series_op``: unlike ``ProxyDataFrame``,
+        ``ProxySeries`` has no ``__setitem__``/``.loc`` override that keeps
+        ``_pandas_obj`` in sync with in-place mutations (see
+        ``ProxySeries.__getitem__``'s docstring for the same issue) -- an
+        in-place ``.loc[i] = None`` before calling ``fillna`` would otherwise
+        silently operate on stale data.
+        """
+        from metaldf._engine import execute
+        from metaldf._wrappers import _wrap_result
+        from metaldf.exceptions import MetalNotAvailable
+
+        current = pd.Series(self._values, index=self.index, name=self.name)
+        if value is not None and np.isscalar(value) and not kwargs.get("method"):
+            try:
+                result = execute("fillna", current, value=value)
+                return _wrap_result(result)
+            except (MetalNotAvailable, Exception):
+                pass
+        result = pd.Series.fillna(current, value=value, **kwargs)
+        return _wrap_result(result)
+
+    def ffill(self, **kwargs: Any) -> Any:
+        return self._try_metal_series_op("ffill")
+
+    def bfill(self, **kwargs: Any) -> Any:
+        return self._try_metal_series_op("bfill")
+
+    def pad(self, **kwargs: Any) -> Any:
+        return self.ffill(**kwargs)
+
+    def backfill(self, **kwargs: Any) -> Any:
+        return self.bfill(**kwargs)
 
     def sort_values(self, ascending: bool = True, **kwargs: Any) -> Any:
         """Sort values, trying Metal first.
@@ -1281,6 +1364,12 @@ class ProxyDatetimeAccessor:
 
     @property
     def dayofweek(self) -> Any: return self._dispatch("dayofweek")
+
+    @property
+    def quarter(self) -> Any: return self._dispatch("quarter")
+
+    @property
+    def dayofyear(self) -> Any: return self._dispatch("dayofyear")
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._real_dt_accessor(), name)

@@ -377,6 +377,24 @@ class DeferredSeries:
             return result / self.size
         return self._materialize().mean(*args, **kwargs)
 
+    def cumsum(self, *args: Any, **kwargs: Any) -> Any:
+        materialized = self._materialize()
+        from metaldf._wrappers import ProxySeries
+        ps = ProxySeries(_pandas_obj=materialized)
+        return ps.cumsum(*args, **kwargs)
+
+    def cummin(self, *args: Any, **kwargs: Any) -> Any:
+        materialized = self._materialize()
+        from metaldf._wrappers import ProxySeries
+        ps = ProxySeries(_pandas_obj=materialized)
+        return ps.cummin(*args, **kwargs)
+
+    def cummax(self, *args: Any, **kwargs: Any) -> Any:
+        materialized = self._materialize()
+        from metaldf._wrappers import ProxySeries
+        ps = ProxySeries(_pandas_obj=materialized)
+        return ps.cummax(*args, **kwargs)
+
     def sort_values(self, ascending: bool = True, **kwargs: Any) -> Any:
         """Materialize the expression via fused codegen, then sort."""
         materialized = self._materialize()

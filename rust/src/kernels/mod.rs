@@ -109,6 +109,9 @@ pub mod filter;
 pub mod join;
 pub mod rolling;
 pub mod datetime;
+pub mod shift;
+pub mod fillna;
+pub mod fill_scan;
 
 include!(concat!(env!("OUT_DIR"), "/common_preamble_src.rs"));
 include!(concat!(env!("OUT_DIR"), "/elementwise_metal_src.rs"));

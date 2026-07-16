@@ -27,14 +27,18 @@ use kernels::strings::{
 };
 use kernels::expression::{eval_expression, eval_expression_reduce};
 use kernels::codegen::{eval_expression_codegen, eval_multi_expression_codegen};
-use kernels::scan::metal_prefix_sum;
+use kernels::scan::{metal_prefix_sum, metal_cumsum, metal_cummin, metal_cummax};
 use kernels::filter::{metal_compact, metal_take};
 use kernels::join::metal_hash_join;
 use kernels::rolling::{metal_rolling_sum, metal_rolling_min, metal_rolling_max, metal_rolling_count, metal_rolling_mean};
 use kernels::datetime::{
     metal_dt_year, metal_dt_month, metal_dt_day,
     metal_dt_hour, metal_dt_minute, metal_dt_second, metal_dt_dayofweek,
+    metal_dt_quarter, metal_dt_dayofyear,
 };
+use kernels::shift::metal_shift;
+use kernels::fillna::metal_fillna;
+use kernels::fill_scan::{metal_ffill, metal_bfill};
 
 #[pyfunction]
 fn metal_gpu_info(py: Python) -> PyResult<PyObject> {
@@ -121,6 +125,9 @@ fn metaldf_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(eval_multi_expression_codegen))?;
     m.add_wrapped(wrap_pyfunction!(metal_gpu_info))?;
     m.add_wrapped(wrap_pyfunction!(metal_prefix_sum))?;
+    m.add_wrapped(wrap_pyfunction!(metal_cumsum))?;
+    m.add_wrapped(wrap_pyfunction!(metal_cummin))?;
+    m.add_wrapped(wrap_pyfunction!(metal_cummax))?;
     m.add_wrapped(wrap_pyfunction!(metal_compact))?;
     m.add_wrapped(wrap_pyfunction!(metal_take))?;
     m.add_wrapped(wrap_pyfunction!(metal_hash_join))?;
@@ -136,6 +143,12 @@ fn metaldf_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(metal_dt_minute))?;
     m.add_wrapped(wrap_pyfunction!(metal_dt_second))?;
     m.add_wrapped(wrap_pyfunction!(metal_dt_dayofweek))?;
+    m.add_wrapped(wrap_pyfunction!(metal_dt_quarter))?;
+    m.add_wrapped(wrap_pyfunction!(metal_dt_dayofyear))?;
+    m.add_wrapped(wrap_pyfunction!(metal_shift))?;
+    m.add_wrapped(wrap_pyfunction!(metal_fillna))?;
+    m.add_wrapped(wrap_pyfunction!(metal_ffill))?;
+    m.add_wrapped(wrap_pyfunction!(metal_bfill))?;
 
     m.add_wrapped(wrap_pyfunction!(py_set_debug_enabled))?;
     m.add_wrapped(wrap_pyfunction!(py_is_debug_enabled))?;

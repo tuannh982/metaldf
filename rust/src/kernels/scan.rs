@@ -1,18 +1,15 @@
-// Prefix-sum / scan kernel dispatch — GPU inclusive scan (cumulative sum).
+// Prefix-sum / cumulative-scan kernel dispatch — GPU inclusive scan
+// (cumsum/cummin/cummax), op-generic since Task 1's scan.metal refactor.
 //
 // Two-pass algorithm (see `rust/metal/scan/scan.metal` for the kernel-level
 // docs): pass 1 scans each `SCAN_TG_SIZE`-element chunk locally (in
-// threadgroup shared memory) and emits one partial (that group's total) per
-// threadgroup; the partials buffer is then recursively scanned (this
-// function calling itself, bottoming out once a single threadgroup covers
-// the whole buffer); pass 2 propagates each group's prefix (the scanned
-// partial contributed by every group before it) into every element of that
-// group. Group 0 has no predecessor and needs no propagation.
-//
-// Only `Int32`/`Uint32` are supported today (see Task 3.1 brief: this is an
-// internal building block for Phase 4 filtering/boolean-indexing and
-// Phase 7 rolling windows, not directly user-facing — float32/int64 support
-// is deferred, and float64 isn't supported on Metal at all, per Task 2.1).
+// threadgroup shared memory) and emits one partial (that group's
+// accumulated op result) per threadgroup; the partials buffer is then
+// recursively scanned (this function calling itself, bottoming out once a
+// single threadgroup covers the whole buffer); pass 2 propagates each
+// group's prefix (the scanned partial contributed by every group before
+// it) into every element of that group. Group 0 has no predecessor and
+// needs no propagation.
 
 use pyo3::prelude::*;
 use metal::{MTLSize, MTLResourceOptions};
@@ -24,29 +21,43 @@ use crate::series::MetalSeries;
 
 const SCAN_TG_SIZE: u64 = 256;
 
-fn check_scan_dtype(dtype: DType) -> PyResult<()> {
+fn check_cumulative_dtype(dtype: DType, op: &str) -> PyResult<()> {
     match dtype {
-        DType::Int32 | DType::Uint32 => Ok(()),
+        DType::Float32 | DType::Int32 | DType::Int64
+        | DType::Datetime | DType::Timedelta => Ok(()),
+        DType::Uint32 if op == "sum" => Ok(()),
         _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "Prefix sum not supported for {:?} (only Int32/Uint32 today)",
-            dtype
+            "Cumulative scan '{}' not supported for {:?}", op, dtype
         ))),
     }
 }
 
-/// Computes the GPU inclusive prefix sum (cumulative sum) of `input` (`len`
-/// elements of `dtype`), returning a freshly allocated buffer of the same
-/// length and dtype. Internal-only — not exposed to Python directly; see
-/// `metal_prefix_sum` below for the pyfunction wrapper.
-pub fn prefix_sum_inclusive(
+fn scan_kernel_suffix(dtype: DType) -> &'static str {
+    match dtype {
+        DType::Float32 => "float32",
+        DType::Int32 => "int32",
+        DType::Int64 | DType::Datetime | DType::Timedelta => "int64",
+        DType::Uint32 => "uint32",
+        _ => unreachable!(),
+    }
+}
+
+/// Computes the GPU inclusive cumulative scan of `input` (`len` elements of
+/// `dtype`) using op `op` (`"sum"`/`"min"`/`"max"`), returning a freshly
+/// allocated buffer of the same length and dtype. Internal-only — not
+/// exposed to Python directly; see `metal_cumsum`/`metal_cummin`/
+/// `metal_cummax` below for the pyfunction wrappers.
+pub fn cumulative_scan(
     input: &metal::Buffer,
     len: usize,
     dtype: DType,
+    op: &str,
 ) -> PyResult<metal::Buffer> {
-    check_scan_dtype(dtype)?;
+    check_cumulative_dtype(dtype, op)?;
 
     let (device, queue) = MetalBackend::device_and_queue()?;
     let elem_size = dtype.size_in_bytes() as u64;
+    let suffix = scan_kernel_suffix(dtype);
 
     // Empty input: nothing to scan. Matches np.cumsum(empty) -> empty.
     if len == 0 {
@@ -55,7 +66,6 @@ pub fn prefix_sum_inclusive(
 
     let library = load_scan_library(device)
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-    let suffix = dtype.kernel_suffix();
 
     // len >= 1 here, so num_groups >= 1 always.
     let num_groups = (len as u64 + SCAN_TG_SIZE - 1) / SCAN_TG_SIZE;
@@ -72,7 +82,8 @@ pub fn prefix_sum_inclusive(
 
     // Pass 1: per-threadgroup local scan, writing scanned output plus one
     // partial (group total) per threadgroup.
-    let scan_pl = get_pipeline_state(device, &library, &format!("scan_inclusive_{suffix}"))
+    let scan_name = format!("scan_inclusive_{op}_{suffix}");
+    let scan_pl = get_pipeline_state(device, &library, &scan_name)
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
     let cb = queue.new_command_buffer();
@@ -93,7 +104,7 @@ pub fn prefix_sum_inclusive(
 
     if cb.status() == metal::MTLCommandBufferStatus::Error {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "Scan pass 1 failed: Metal command buffer error",
+            format!("Scan pass 1 ({scan_name}) failed"),
         ));
     }
 
@@ -103,11 +114,12 @@ pub fn prefix_sum_inclusive(
 
     // Recursively scan the per-group partials: turns per-group totals into
     // per-group inclusive prefixes over all groups up to and including it.
-    let scanned_partials = prefix_sum_inclusive(&partials, num_groups as usize, dtype)?;
+    let scanned_partials = cumulative_scan(&partials, num_groups as usize, dtype, op)?;
 
     // Pass 2: propagate each group's exclusive prefix (the prior group's
     // scanned partial) into every element of that group.
-    let prop_pl = get_pipeline_state(device, &library, &format!("scan_propagate_{suffix}"))
+    let prop_name = format!("scan_propagate_{op}_{suffix}");
+    let prop_pl = get_pipeline_state(device, &library, &prop_name)
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
     let cb2 = queue.new_command_buffer();
@@ -126,19 +138,51 @@ pub fn prefix_sum_inclusive(
 
     if cb2.status() == metal::MTLCommandBufferStatus::Error {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "Scan pass 2 (propagate) failed: Metal command buffer error",
+            format!("Scan pass 2 ({prop_name}) failed"),
         ));
     }
 
     Ok(output)
 }
 
-/// Python-facing GPU inclusive prefix sum (`cumsum`). Supports `Int32`- and
-/// `Uint32`-dtype series today (see module docs above).
+/// Backward-compat wrapper used by filter.rs
+pub fn prefix_sum_inclusive(
+    input: &metal::Buffer,
+    len: usize,
+    dtype: DType,
+) -> PyResult<metal::Buffer> {
+    cumulative_scan(input, len, dtype, "sum")
+}
+
+/// Python-facing GPU inclusive prefix sum (`cumsum`).
 #[pyfunction]
 pub fn metal_prefix_sum(input: &MetalSeries) -> PyResult<MetalSeries> {
     let buf = input.as_numeric_checked()?;
-    let result = prefix_sum_inclusive(buf.metal_buffer(), buf.len, buf.dtype)?;
+    let result = cumulative_scan(buf.metal_buffer(), buf.len, buf.dtype, "sum")?;
+    let result_buf = SharedBuffer::from_metal_buffer(result, buf.len, buf.dtype);
+    Ok(MetalSeries::from_numeric(result_buf))
+}
+
+#[pyfunction]
+pub fn metal_cumsum(input: &MetalSeries) -> PyResult<MetalSeries> {
+    let buf = input.as_numeric_checked()?;
+    let result = cumulative_scan(buf.metal_buffer(), buf.len, buf.dtype, "sum")?;
+    let result_buf = SharedBuffer::from_metal_buffer(result, buf.len, buf.dtype);
+    Ok(MetalSeries::from_numeric(result_buf))
+}
+
+#[pyfunction]
+pub fn metal_cummin(input: &MetalSeries) -> PyResult<MetalSeries> {
+    let buf = input.as_numeric_checked()?;
+    let result = cumulative_scan(buf.metal_buffer(), buf.len, buf.dtype, "min")?;
+    let result_buf = SharedBuffer::from_metal_buffer(result, buf.len, buf.dtype);
+    Ok(MetalSeries::from_numeric(result_buf))
+}
+
+#[pyfunction]
+pub fn metal_cummax(input: &MetalSeries) -> PyResult<MetalSeries> {
+    let buf = input.as_numeric_checked()?;
+    let result = cumulative_scan(buf.metal_buffer(), buf.len, buf.dtype, "max")?;
     let result_buf = SharedBuffer::from_metal_buffer(result, buf.len, buf.dtype);
     Ok(MetalSeries::from_numeric(result_buf))
 }

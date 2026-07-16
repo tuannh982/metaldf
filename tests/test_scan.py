@@ -6,7 +6,9 @@ Phase 4 (filtering/boolean indexing) and Phase 7 (rolling windows). Not
 directly user-facing -- exercised here purely at the `metaldf_engine` level,
 verified against `np.cumsum()`.
 
-Only Int32/Uint32 are supported today (see `rust/src/kernels/scan.rs`).
+`metal_prefix_sum` is a thin wrapper around the op-generic `cumulative_scan`
+dispatch (see `rust/src/kernels/scan.rs`); it supports Float32/Int32/Int64/
+Uint32 (plus Datetime/Timedelta, which share the int64 kernels).
 """
 
 import numpy as np
@@ -123,15 +125,27 @@ class TestPrefixSumUint32:
         np.testing.assert_array_equal(result.to_numpy(), np.cumsum(arr, dtype=np.uint32))
 
 
-class TestPrefixSumUnsupportedDtype:
-    def test_float32_rejected(self):
+class TestPrefixSumNowSupportedDtype:
+    # Task 1 (op-generic scan.metal) added sum kernels for float32/int64,
+    # and Task 2's `cumulative_scan` dispatch (which `metal_prefix_sum` now
+    # wraps) accepts them -- previously these dtypes raised TypeError since
+    # only int32_/uint32_-suffixed sum kernels existed.
+    def test_float32_now_supported(self):
         arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
         ms = metaldf_engine.MetalSeries.from_numpy(arr)
-        with pytest.raises(TypeError):
-            metaldf_engine.metal_prefix_sum(ms)
+        result = metaldf_engine.metal_prefix_sum(ms)
+        np.testing.assert_allclose(result.to_numpy(), np.cumsum(arr), rtol=1e-5)
 
-    def test_int64_rejected(self):
+    def test_int64_now_supported(self):
         arr = np.array([1, 2, 3], dtype=np.int64)
         ms = metaldf_engine.MetalSeries.from_numpy_i64(arr)
+        result = metaldf_engine.metal_prefix_sum(ms)
+        np.testing.assert_array_equal(result.to_numpy(), np.cumsum(arr))
+
+
+class TestPrefixSumUnsupportedDtype:
+    def test_bool_rejected(self):
+        arr = np.array([1, 0, 1], dtype=np.uint8)
+        ms = metaldf_engine.MetalSeries.from_numpy_bool(arr)
         with pytest.raises(TypeError):
             metaldf_engine.metal_prefix_sum(ms)

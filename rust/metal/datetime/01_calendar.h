@@ -68,3 +68,14 @@ inline CivilDate civil_from_days(long z) {
     y += (m <= 2);
     return CivilDate{int(y), int(m), int(d)};
 }
+
+// Howard Hinnant's inverse: (year, month, day) -> day count relative to epoch.
+// See http://howardhinnant.github.io/date_algorithms.html
+inline long days_from_civil(int y, int m, int d) {
+    y -= (m <= 2);
+    long era = (y >= 0 ? y : y - 399) / 400;
+    uint yoe = uint(y - era * 400);
+    uint doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    uint doe = yoe * 365 + yoe/4 - yoe/100 + doy;
+    return era * 146097 + long(doe) - 719468;
+}

@@ -187,6 +187,160 @@ def _dispatch_reduction(op_name: str, data: Any) -> Any:
     return rust_fn(buf)
 
 
+# ---------------------------------------------------------------------------
+# Cumulative op dtype support
+# ---------------------------------------------------------------------------
+
+# NOTE: use np.dtype(...) instances, not bare numpy scalar types -- see the
+# _SORT_DTYPES comment above for why comparing dtype instances to bare
+# numpy scalar types silently breaks set/dict membership checks.
+_CUMULATIVE_DTYPES = {np.dtype(np.float32), np.dtype(np.int32), np.dtype(np.int64),
+                      _DATETIME_DTYPE, _TIMEDELTA_DTYPE}
+
+
+def _dispatch_cumulative(op_name: str, data: Any) -> Any:
+    """Try Metal cumulative scan, raise MetalNotAvailable on failure."""
+    if not _has_metal():
+        raise MetalNotAvailable("Metal not available")
+
+    from metaldf._wrappers import ProxySeries
+    if isinstance(data, ProxySeries) and hasattr(data, "_pandas_obj"):
+        data = data.to_pandas()
+
+    if not hasattr(data, "dtype"):
+        raise MetalNotAvailable("Operand must be a pandas Series or numpy array")
+
+    if data.dtype not in _CUMULATIVE_DTYPES:
+        raise MetalNotAvailable(f"Unsupported dtype for cumulative: {data.dtype}")
+
+    if data.dtype == _DATETIME_DTYPE and op_name == "cumsum":
+        raise MetalNotAvailable("cumsum not meaningful for datetime")
+
+    arr = _extract_array(data)
+    if arr.dtype == np.dtype(np.float32) and np.any(np.isnan(arr)):
+        raise MetalNotAvailable("cumulative scan on GPU does not yet support NaN (skipna)")
+
+    buf = _make_series(arr)
+    rust_fn = getattr(metaldf_engine, f"metal_{op_name}")
+    result = rust_fn(buf)
+    out_arr = result.to_numpy()
+    out_arr = _restore_datetime_dtype(out_arr, data.dtype)
+    return pd.Series(out_arr, index=data.index if hasattr(data, 'index') else None,
+                     name=getattr(data, 'name', None))
+
+
+def _dispatch_shift(data: Any, periods: int = 1) -> Any:
+    """Try Metal shift, raise MetalNotAvailable on failure."""
+    if not _has_metal():
+        raise MetalNotAvailable("Metal not available")
+
+    from metaldf._wrappers import ProxySeries
+    if isinstance(data, ProxySeries) and hasattr(data, "_pandas_obj"):
+        data = data.to_pandas()
+
+    if not hasattr(data, "dtype"):
+        raise MetalNotAvailable("Operand must be a pandas Series or numpy array")
+
+    if data.dtype not in _SUPPORTED_DTYPES:
+        raise MetalNotAvailable(f"Unsupported dtype for shift: {data.dtype}")
+
+    arr = _extract_array(data)
+    buf = _make_series(arr)
+    periods = int(periods)
+    result = metaldf_engine.metal_shift(buf, periods)
+    out_arr = result.to_numpy()
+
+    # The GPU kernel fills out-of-bounds positions with a raw 0 for every
+    # integer dtype (see rust/metal/elementwise/shift.metal) -- it has no
+    # notion of pandas' missing-value sentinels. Reconcile that here so the
+    # result matches what `pd.Series.shift` itself would produce, and so
+    # `diff`/`pct_change` (built on top of `shift`, see `ProxySeries`) don't
+    # silently compute against a bogus `0` fill instead of a real "missing"
+    # marker:
+    #   - float32: the kernel already fills with NaN bit-for-bit -- no-op.
+    #   - datetime64/timedelta64: stays as its own dtype, but the filled
+    #     slots must read back as NaT rather than the 1970-01-01 epoch.
+    #   - plain int32/int64: pandas upcasts the whole result to float64
+    #     (ints can't represent NaN), whenever `periods != 0`.
+    n = len(out_arr)
+    fill_count = min(abs(periods), n) if periods != 0 else 0
+    if data.dtype == _DATETIME_DTYPE or data.dtype == _TIMEDELTA_DTYPE:
+        out_arr = _restore_datetime_dtype(out_arr, data.dtype)
+        if fill_count > 0:
+            nat = (np.datetime64('NaT', 'ns') if data.dtype == _DATETIME_DTYPE
+                   else np.timedelta64('NaT', 'ns'))
+            if periods > 0:
+                out_arr[:fill_count] = nat
+            else:
+                out_arr[n - fill_count:] = nat
+    elif periods != 0 and data.dtype != np.dtype(np.float32):
+        out_arr = out_arr.astype(np.float64)
+        if fill_count > 0:
+            if periods > 0:
+                out_arr[:fill_count] = np.nan
+            else:
+                out_arr[n - fill_count:] = np.nan
+
+    return pd.Series(out_arr, index=data.index if hasattr(data, 'index') else None,
+                     name=getattr(data, 'name', None))
+
+
+def _dispatch_fillna(data: Any, fill_value: float) -> Any:
+    """Try Metal fillna, raise MetalNotAvailable on failure."""
+    if not _has_metal():
+        raise MetalNotAvailable("Metal not available")
+
+    from metaldf._wrappers import ProxySeries
+    if isinstance(data, ProxySeries) and hasattr(data, "_pandas_obj"):
+        data = data.to_pandas()
+
+    if not hasattr(data, "dtype") or data.dtype != np.dtype(np.float32):
+        raise MetalNotAvailable(f"fillna GPU only supports float32")
+
+    arr = _extract_array(data)
+    buf = _make_series(arr)
+    result = metaldf_engine.metal_fillna(buf, float(fill_value))
+    return pd.Series(result.to_numpy(), index=data.index if hasattr(data, 'index') else None,
+                     name=getattr(data, 'name', None))
+
+
+def _dispatch_ffill(data: Any) -> Any:
+    """Try Metal ffill (forward-fill via parallel scan), raise MetalNotAvailable on failure."""
+    if not _has_metal():
+        raise MetalNotAvailable("Metal not available")
+
+    from metaldf._wrappers import ProxySeries
+    if isinstance(data, ProxySeries) and hasattr(data, "_pandas_obj"):
+        data = data.to_pandas()
+
+    if not hasattr(data, "dtype") or data.dtype != np.dtype(np.float32):
+        raise MetalNotAvailable("ffill GPU only supports float32")
+
+    arr = _extract_array(data)
+    buf = _make_series(arr)
+    result = metaldf_engine.metal_ffill(buf)
+    return pd.Series(result.to_numpy(), index=data.index if hasattr(data, 'index') else None,
+                     name=getattr(data, 'name', None))
+
+
+def _dispatch_bfill(data: Any) -> Any:
+    """Try Metal bfill (backward-fill via parallel scan), raise MetalNotAvailable on failure."""
+    if not _has_metal():
+        raise MetalNotAvailable("Metal not available")
+
+    from metaldf._wrappers import ProxySeries
+    if isinstance(data, ProxySeries) and hasattr(data, "_pandas_obj"):
+        data = data.to_pandas()
+
+    if not hasattr(data, "dtype") or data.dtype != np.dtype(np.float32):
+        raise MetalNotAvailable("bfill GPU only supports float32")
+
+    arr = _extract_array(data)
+    buf = _make_series(arr)
+    result = metaldf_engine.metal_bfill(buf)
+    return pd.Series(result.to_numpy(), index=data.index if hasattr(data, 'index') else None,
+                     name=getattr(data, 'name', None))
+
 
 # ---------------------------------------------------------------------------
 # Elementwise binary op dtype support
@@ -593,6 +747,40 @@ class MetalEngine:
     @staticmethod
     def metal_mean(data: Any) -> float:
         return _dispatch_reduction("mean", data)
+
+    # -- Cumulative ops ----------------------------------------------------
+
+    @staticmethod
+    def metal_cumsum(data: Any) -> Any:
+        return _dispatch_cumulative("cumsum", data)
+
+    @staticmethod
+    def metal_cummin(data: Any) -> Any:
+        return _dispatch_cumulative("cummin", data)
+
+    @staticmethod
+    def metal_cummax(data: Any) -> Any:
+        return _dispatch_cumulative("cummax", data)
+
+    # -- Shift --------------------------------------------------------------
+
+    @staticmethod
+    def metal_shift(data: Any, periods: int = 1) -> Any:
+        return _dispatch_shift(data, periods)
+
+    # -- Fill ---------------------------------------------------------------
+
+    @staticmethod
+    def metal_fillna(data: Any, value: float = 0.0) -> Any:
+        return _dispatch_fillna(data, value)
+
+    @staticmethod
+    def metal_ffill(data: Any) -> Any:
+        return _dispatch_ffill(data)
+
+    @staticmethod
+    def metal_bfill(data: Any) -> Any:
+        return _dispatch_bfill(data)
 
     # -- Elementwise binary ops ------------------------------------------
 

@@ -103,3 +103,13 @@ pub fn metal_dt_second(data: &MetalSeries) -> PyResult<MetalSeries> {
 pub fn metal_dt_dayofweek(data: &MetalSeries) -> PyResult<MetalSeries> {
     dispatch_dt_extract("dt_dayofweek_i64", data)
 }
+
+#[pyfunction]
+pub fn metal_dt_quarter(data: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_dt_extract("dt_quarter_i64", data)
+}
+
+#[pyfunction]
+pub fn metal_dt_dayofyear(data: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_dt_extract("dt_dayofyear_i64", data)
+}

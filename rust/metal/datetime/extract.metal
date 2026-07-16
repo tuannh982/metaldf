@@ -75,3 +75,24 @@ kernel void dt_dayofweek_i64(device const long* ns [[buffer(0)]],
     long days = floor_div(ns[idx], NS_PER_DAY);
     out[idx] = int(floor_mod(days + 3, 7L));
 }
+
+kernel void dt_quarter_i64(device const long* ns [[buffer(0)]],
+                           device int* out        [[buffer(1)]],
+                           device const uint* len_ptr [[buffer(2)]],
+                           uint idx [[thread_position_in_grid]]) {
+    if (idx >= *len_ptr) return;
+    long days = floor_div(ns[idx], NS_PER_DAY);
+    int month = civil_from_days(days).month;
+    out[idx] = (month - 1) / 3 + 1;
+}
+
+kernel void dt_dayofyear_i64(device const long* ns [[buffer(0)]],
+                              device int* out        [[buffer(1)]],
+                              device const uint* len_ptr [[buffer(2)]],
+                              uint idx [[thread_position_in_grid]]) {
+    if (idx >= *len_ptr) return;
+    long days = floor_div(ns[idx], NS_PER_DAY);
+    CivilDate c = civil_from_days(days);
+    long jan1 = days_from_civil(c.year, 1, 1);
+    out[idx] = int(days - jan1) + 1;
+}
