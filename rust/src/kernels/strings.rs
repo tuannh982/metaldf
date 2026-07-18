@@ -209,6 +209,197 @@ pub fn metal_string_find(series: &MetalSeries, pattern: &str) -> PyResult<MetalS
 }
 
 // ---------------------------------------------------------------------------
+// Intrinsic kernels — len (per-element byte length) and count (occurrences
+// of a scalar pattern). Both return MetalSeries::Numeric(Int64).
+// ---------------------------------------------------------------------------
+
+fn dispatch_string_len(
+    series: &MetalSeries,
+) -> PyResult<MetalSeries> {
+    let (offsets, _chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let pipeline = get_pipeline_state(device, &library, "string_len")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+    let output = device.new_buffer(n * 8, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(&output), 0);
+    enc.set_buffer(2, Some(&len_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_groups, 1, 1),
+        MTLSize::new(THREADGROUP_SIZE, 1, 1),
+    );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "string_len failed: Metal command buffer error"
+        ));
+    }
+
+    Ok(MetalSeries::from_numeric(SharedBuffer::from_metal_buffer(output, n as usize, DType::Int64)))
+}
+
+fn dispatch_string_count(
+    series: &MetalSeries,
+    pattern: &str,
+) -> PyResult<MetalSeries> {
+    let (offsets, chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let pipeline = get_pipeline_state(device, &library, "string_count")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+    let (pat_offsets_buf, pat_chars_buf) = build_scalar_string_buffers(device, pattern);
+    let output = device.new_buffer(n * 8, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc.set_buffer(2, Some(&pat_offsets_buf), 0);
+    enc.set_buffer(3, Some(&pat_chars_buf), 0);
+    enc.set_buffer(4, Some(&output), 0);
+    enc.set_buffer(5, Some(&len_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_groups, 1, 1),
+        MTLSize::new(THREADGROUP_SIZE, 1, 1),
+    );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "string_count failed: Metal command buffer error"
+        ));
+    }
+
+    Ok(MetalSeries::from_numeric(SharedBuffer::from_metal_buffer(output, n as usize, DType::Int64)))
+}
+
+#[pyfunction]
+pub fn metal_string_len(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_len(series)
+}
+
+#[pyfunction]
+pub fn metal_string_count(series: &MetalSeries, pattern: &str) -> PyResult<MetalSeries> {
+    dispatch_string_count(series, pattern)
+}
+
+// ---------------------------------------------------------------------------
+// Classification kernels — isalpha/isdigit/isspace/isalnum/isupper/islower/
+// istitle (plus isnumeric/isdecimal aliases to isdigit). All return
+// MetalSeries::Numeric(Int32) 0/1, same buffer layout as
+// dispatch_string_scalar_compare minus the pattern argument.
+// ---------------------------------------------------------------------------
+
+fn dispatch_string_classify(
+    kernel_name: &str,
+    series: &MetalSeries,
+) -> PyResult<MetalSeries> {
+    let (offsets, chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let pipeline = get_pipeline_state(device, &library, kernel_name)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+    let output = device.new_buffer(n * 4, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc.set_buffer(2, Some(&output), 0);
+    enc.set_buffer(3, Some(&len_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_groups, 1, 1),
+        MTLSize::new(THREADGROUP_SIZE, 1, 1),
+    );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            format!("{} failed: Metal command buffer error", kernel_name)
+        ));
+    }
+
+    Ok(MetalSeries::from_numeric(SharedBuffer::from_metal_buffer(output, n as usize, DType::Int32)))
+}
+
+#[pyfunction]
+pub fn metal_string_isalpha(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_classify("string_isalpha", series)
+}
+
+#[pyfunction]
+pub fn metal_string_isdigit(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_classify("string_isdigit", series)
+}
+
+#[pyfunction]
+pub fn metal_string_isspace(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_classify("string_isspace", series)
+}
+
+#[pyfunction]
+pub fn metal_string_isalnum(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_classify("string_isalnum", series)
+}
+
+#[pyfunction]
+pub fn metal_string_isupper(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_classify("string_isupper", series)
+}
+
+#[pyfunction]
+pub fn metal_string_islower(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_classify("string_islower", series)
+}
+
+#[pyfunction]
+pub fn metal_string_istitle(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_classify("string_istitle", series)
+}
+
+#[pyfunction]
+pub fn metal_string_isnumeric(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_classify("string_isdigit", series)
+}
+
+#[pyfunction]
+pub fn metal_string_isdecimal(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_classify("string_isdigit", series)
+}
+
+// ---------------------------------------------------------------------------
 // Transform kernels — lower/upper (same-length, single-pass) and
 // strip/replace (variable-length, two-pass: GPU sizes -> CPU prefix-sum ->
 // GPU write).
@@ -273,6 +464,26 @@ pub fn metal_string_lower(series: &MetalSeries) -> PyResult<MetalSeries> {
 #[pyfunction]
 pub fn metal_string_upper(series: &MetalSeries) -> PyResult<MetalSeries> {
     dispatch_string_inplace_transform("string_upper", series)
+}
+
+#[pyfunction]
+pub fn metal_string_swapcase(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_inplace_transform("string_swapcase", series)
+}
+
+#[pyfunction]
+pub fn metal_string_title(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_inplace_transform("string_title", series)
+}
+
+#[pyfunction]
+pub fn metal_string_capitalize(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_inplace_transform("string_capitalize", series)
+}
+
+#[pyfunction]
+pub fn metal_string_casefold(series: &MetalSeries) -> PyResult<MetalSeries> {
+    dispatch_string_inplace_transform("string_lower", series)
 }
 
 #[pyfunction]
@@ -356,6 +567,180 @@ pub fn metal_string_strip(series: &MetalSeries) -> PyResult<MetalSeries> {
     if cb2.status() == metal::MTLCommandBufferStatus::Error {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "string_strip_write failed: Metal command buffer error".to_string()
+        ));
+    }
+
+    let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n as usize + 1, DType::Int64);
+    let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
+
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
+}
+
+#[pyfunction]
+pub fn metal_string_lstrip(series: &MetalSeries) -> PyResult<MetalSeries> {
+    let (offsets, chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+
+    let sizes_buf = device.new_buffer(n * 8, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let sizes_pl = get_pipeline_state(device, &library, "string_lstrip_sizes")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&sizes_pl);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc.set_buffer(2, Some(&sizes_buf), 0);
+    enc.set_buffer(3, Some(&len_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_groups, 1, 1),
+        MTLSize::new(THREADGROUP_SIZE, 1, 1),
+    );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "string_lstrip_sizes failed: Metal command buffer error".to_string()
+        ));
+    }
+
+    let new_offsets_buf = device.new_buffer(
+        (n as usize + 1) as u64 * 8,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let mut total_chars: i64 = 0;
+    unsafe {
+        let sizes_ptr = sizes_buf.contents() as *const i64;
+        let offsets_ptr = new_offsets_buf.contents() as *mut i64;
+        for i in 0..n as usize {
+            *offsets_ptr.add(i) = total_chars;
+            total_chars += *sizes_ptr.add(i);
+        }
+        *offsets_ptr.add(n as usize) = total_chars;
+    }
+
+    let new_chars_buf = device.new_buffer(
+        total_chars.max(1) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    let write_pl = get_pipeline_state(device, &library, "string_lstrip_write")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb2 = queue.new_command_buffer();
+    let enc2 = cb2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&write_pl);
+    enc2.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc2.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&new_offsets_buf), 0);
+    enc2.set_buffer(3, Some(&new_chars_buf), 0);
+    enc2.set_buffer(4, Some(&len_buf), 0);
+    enc2.dispatch_thread_groups(
+        MTLSize::new(num_groups, 1, 1),
+        MTLSize::new(THREADGROUP_SIZE, 1, 1),
+    );
+    enc2.end_encoding();
+    cb2.commit();
+    cb2.wait_until_completed();
+
+    if cb2.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "string_lstrip_write failed: Metal command buffer error".to_string()
+        ));
+    }
+
+    let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n as usize + 1, DType::Int64);
+    let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
+
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
+}
+
+#[pyfunction]
+pub fn metal_string_rstrip(series: &MetalSeries) -> PyResult<MetalSeries> {
+    let (offsets, chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+
+    let sizes_buf = device.new_buffer(n * 8, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let sizes_pl = get_pipeline_state(device, &library, "string_rstrip_sizes")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&sizes_pl);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc.set_buffer(2, Some(&sizes_buf), 0);
+    enc.set_buffer(3, Some(&len_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_groups, 1, 1),
+        MTLSize::new(THREADGROUP_SIZE, 1, 1),
+    );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "string_rstrip_sizes failed: Metal command buffer error".to_string()
+        ));
+    }
+
+    let new_offsets_buf = device.new_buffer(
+        (n as usize + 1) as u64 * 8,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let mut total_chars: i64 = 0;
+    unsafe {
+        let sizes_ptr = sizes_buf.contents() as *const i64;
+        let offsets_ptr = new_offsets_buf.contents() as *mut i64;
+        for i in 0..n as usize {
+            *offsets_ptr.add(i) = total_chars;
+            total_chars += *sizes_ptr.add(i);
+        }
+        *offsets_ptr.add(n as usize) = total_chars;
+    }
+
+    let new_chars_buf = device.new_buffer(
+        total_chars.max(1) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    let write_pl = get_pipeline_state(device, &library, "string_rstrip_write")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb2 = queue.new_command_buffer();
+    let enc2 = cb2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&write_pl);
+    enc2.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc2.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&new_offsets_buf), 0);
+    enc2.set_buffer(3, Some(&new_chars_buf), 0);
+    enc2.set_buffer(4, Some(&len_buf), 0);
+    enc2.dispatch_thread_groups(
+        MTLSize::new(num_groups, 1, 1),
+        MTLSize::new(THREADGROUP_SIZE, 1, 1),
+    );
+    enc2.end_encoding();
+    cb2.commit();
+    cb2.wait_until_completed();
+
+    if cb2.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "string_rstrip_write failed: Metal command buffer error".to_string()
         ));
     }
 
@@ -465,6 +850,480 @@ pub fn metal_string_replace(series: &MetalSeries, pat: &str, repl: &str) -> PyRe
     let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
 
     Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
+}
+
+// ---------------------------------------------------------------------------
+// Manipulate kernels — slice/get/repeat (variable-length, two-pass: GPU
+// sizes -> CPU prefix-sum -> GPU write). Scalar parameters (start/stop, idx,
+// repeat count) are passed to the GPU via small Metal buffers.
+// ---------------------------------------------------------------------------
+
+#[pyfunction]
+pub fn metal_string_slice(series: &MetalSeries, start: i32, stop: i32) -> PyResult<MetalSeries> {
+    let (offsets, chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+
+    let params_buf = device.new_buffer(8, MTLResourceOptions::StorageModeShared);
+    unsafe {
+        let ptr = params_buf.contents() as *mut i32;
+        *ptr = start;
+        *ptr.add(1) = stop;
+    }
+
+    // Pass 1: sizes
+    let sizes_buf = device.new_buffer(n * 8, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let sizes_pl = get_pipeline_state(device, &library, "string_slice_sizes")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&sizes_pl);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(&sizes_buf), 0);
+    enc.set_buffer(2, Some(&len_buf), 0);
+    enc.set_buffer(3, Some(&params_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_groups, 1, 1),
+        MTLSize::new(THREADGROUP_SIZE, 1, 1),
+    );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "string_slice_sizes failed: Metal command buffer error"
+        ));
+    }
+
+    // CPU prefix-sum
+    let new_offsets_buf = device.new_buffer((n as usize + 1) as u64 * 8, MTLResourceOptions::StorageModeShared);
+    let mut total_chars: i64 = 0;
+    unsafe {
+        let sizes_ptr = sizes_buf.contents() as *const i64;
+        let offsets_ptr = new_offsets_buf.contents() as *mut i64;
+        for i in 0..n as usize {
+            *offsets_ptr.add(i) = total_chars;
+            total_chars += *sizes_ptr.add(i);
+        }
+        *offsets_ptr.add(n as usize) = total_chars;
+    }
+
+    // Pass 2: write
+    let new_chars_buf = device.new_buffer(total_chars.max(1) as u64, MTLResourceOptions::StorageModeShared);
+    let write_pl = get_pipeline_state(device, &library, "string_slice_write")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb2 = queue.new_command_buffer();
+    let enc2 = cb2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&write_pl);
+    enc2.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc2.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&new_offsets_buf), 0);
+    enc2.set_buffer(3, Some(&new_chars_buf), 0);
+    enc2.set_buffer(4, Some(&len_buf), 0);
+    enc2.set_buffer(5, Some(&params_buf), 0);
+    enc2.dispatch_thread_groups(
+        MTLSize::new(num_groups, 1, 1),
+        MTLSize::new(THREADGROUP_SIZE, 1, 1),
+    );
+    enc2.end_encoding();
+    cb2.commit();
+    cb2.wait_until_completed();
+
+    if cb2.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "string_slice_write failed: Metal command buffer error"
+        ));
+    }
+
+    let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n as usize + 1, DType::Int64);
+    let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
+}
+
+#[pyfunction]
+pub fn metal_string_get(series: &MetalSeries, idx: i32) -> PyResult<MetalSeries> {
+    let (offsets, chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+    let idx_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(idx_buf.contents() as *mut i32) = idx; }
+
+    let sizes_buf = device.new_buffer(n * 8, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let sizes_pl = get_pipeline_state(device, &library, "string_get_sizes")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&sizes_pl);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(&sizes_buf), 0);
+    enc.set_buffer(2, Some(&len_buf), 0);
+    enc.set_buffer(3, Some(&idx_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(MTLSize::new(num_groups, 1, 1), MTLSize::new(THREADGROUP_SIZE, 1, 1));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("string_get_sizes failed: Metal command buffer error"));
+    }
+
+    let new_offsets_buf = device.new_buffer((n as usize + 1) as u64 * 8, MTLResourceOptions::StorageModeShared);
+    let mut total_chars: i64 = 0;
+    unsafe {
+        let sizes_ptr = sizes_buf.contents() as *const i64;
+        let offsets_ptr = new_offsets_buf.contents() as *mut i64;
+        for i in 0..n as usize {
+            *offsets_ptr.add(i) = total_chars;
+            total_chars += *sizes_ptr.add(i);
+        }
+        *offsets_ptr.add(n as usize) = total_chars;
+    }
+
+    let new_chars_buf = device.new_buffer(total_chars.max(1) as u64, MTLResourceOptions::StorageModeShared);
+    let write_pl = get_pipeline_state(device, &library, "string_get_write")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb2 = queue.new_command_buffer();
+    let enc2 = cb2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&write_pl);
+    enc2.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc2.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&new_offsets_buf), 0);
+    enc2.set_buffer(3, Some(&new_chars_buf), 0);
+    enc2.set_buffer(4, Some(&len_buf), 0);
+    enc2.set_buffer(5, Some(&idx_buf), 0);
+    enc2.dispatch_thread_groups(MTLSize::new(num_groups, 1, 1), MTLSize::new(THREADGROUP_SIZE, 1, 1));
+    enc2.end_encoding();
+    cb2.commit();
+    cb2.wait_until_completed();
+    if cb2.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("string_get_write failed: Metal command buffer error"));
+    }
+
+    let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n as usize + 1, DType::Int64);
+    let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
+}
+
+#[pyfunction]
+pub fn metal_string_repeat(series: &MetalSeries, n_repeats: u32) -> PyResult<MetalSeries> {
+    let (offsets, chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+    let rn_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(rn_buf.contents() as *mut u32) = n_repeats; }
+
+    let sizes_buf = device.new_buffer(n * 8, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let sizes_pl = get_pipeline_state(device, &library, "string_repeat_sizes")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&sizes_pl);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(&sizes_buf), 0);
+    enc.set_buffer(2, Some(&len_buf), 0);
+    enc.set_buffer(3, Some(&rn_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(MTLSize::new(num_groups, 1, 1), MTLSize::new(THREADGROUP_SIZE, 1, 1));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("string_repeat_sizes failed: Metal command buffer error"));
+    }
+
+    let new_offsets_buf = device.new_buffer((n as usize + 1) as u64 * 8, MTLResourceOptions::StorageModeShared);
+    let mut total_chars: i64 = 0;
+    unsafe {
+        let sizes_ptr = sizes_buf.contents() as *const i64;
+        let offsets_ptr = new_offsets_buf.contents() as *mut i64;
+        for i in 0..n as usize {
+            *offsets_ptr.add(i) = total_chars;
+            total_chars += *sizes_ptr.add(i);
+        }
+        *offsets_ptr.add(n as usize) = total_chars;
+    }
+
+    let new_chars_buf = device.new_buffer(total_chars.max(1) as u64, MTLResourceOptions::StorageModeShared);
+    let write_pl = get_pipeline_state(device, &library, "string_repeat_write")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb2 = queue.new_command_buffer();
+    let enc2 = cb2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&write_pl);
+    enc2.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc2.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&new_offsets_buf), 0);
+    enc2.set_buffer(3, Some(&new_chars_buf), 0);
+    enc2.set_buffer(4, Some(&len_buf), 0);
+    enc2.set_buffer(5, Some(&rn_buf), 0);
+    enc2.dispatch_thread_groups(MTLSize::new(num_groups, 1, 1), MTLSize::new(THREADGROUP_SIZE, 1, 1));
+    enc2.end_encoding();
+    cb2.commit();
+    cb2.wait_until_completed();
+    if cb2.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("string_repeat_write failed: Metal command buffer error"));
+    }
+
+    let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n as usize + 1, DType::Int64);
+    let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
+}
+
+#[pyfunction]
+pub fn metal_string_pad(series: &MetalSeries, width: i32, side: i32, fillchar: i32) -> PyResult<MetalSeries> {
+    let (offsets, chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+    let params_buf = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+    unsafe {
+        let ptr = params_buf.contents() as *mut i32;
+        *ptr = width;
+        *ptr.add(1) = side;
+        *ptr.add(2) = fillchar;
+    }
+
+    let sizes_buf = device.new_buffer(n * 8, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let sizes_pl = get_pipeline_state(device, &library, "string_pad_sizes")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&sizes_pl);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(&sizes_buf), 0);
+    enc.set_buffer(2, Some(&len_buf), 0);
+    enc.set_buffer(3, Some(&params_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(MTLSize::new(num_groups, 1, 1), MTLSize::new(THREADGROUP_SIZE, 1, 1));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("string_pad_sizes failed: Metal command buffer error"));
+    }
+
+    let new_offsets_buf = device.new_buffer((n as usize + 1) as u64 * 8, MTLResourceOptions::StorageModeShared);
+    let mut total_chars: i64 = 0;
+    unsafe {
+        let sizes_ptr = sizes_buf.contents() as *const i64;
+        let offsets_ptr = new_offsets_buf.contents() as *mut i64;
+        for i in 0..n as usize {
+            *offsets_ptr.add(i) = total_chars;
+            total_chars += *sizes_ptr.add(i);
+        }
+        *offsets_ptr.add(n as usize) = total_chars;
+    }
+
+    let new_chars_buf = device.new_buffer(total_chars.max(1) as u64, MTLResourceOptions::StorageModeShared);
+    let write_pl = get_pipeline_state(device, &library, "string_pad_write")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb2 = queue.new_command_buffer();
+    let enc2 = cb2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&write_pl);
+    enc2.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc2.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&new_offsets_buf), 0);
+    enc2.set_buffer(3, Some(&new_chars_buf), 0);
+    enc2.set_buffer(4, Some(&len_buf), 0);
+    enc2.set_buffer(5, Some(&params_buf), 0);
+    enc2.dispatch_thread_groups(MTLSize::new(num_groups, 1, 1), MTLSize::new(THREADGROUP_SIZE, 1, 1));
+    enc2.end_encoding();
+    cb2.commit();
+    cb2.wait_until_completed();
+    if cb2.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("string_pad_write failed: Metal command buffer error"));
+    }
+
+    let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n as usize + 1, DType::Int64);
+    let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
+}
+
+#[pyfunction]
+pub fn metal_string_zfill(series: &MetalSeries, width: i32) -> PyResult<MetalSeries> {
+    let (offsets, chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+    let width_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(width_buf.contents() as *mut i32) = width; }
+
+    let sizes_buf = device.new_buffer(n * 8, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let sizes_pl = get_pipeline_state(device, &library, "string_zfill_sizes")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&sizes_pl);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(&sizes_buf), 0);
+    enc.set_buffer(2, Some(&len_buf), 0);
+    enc.set_buffer(3, Some(&width_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(MTLSize::new(num_groups, 1, 1), MTLSize::new(THREADGROUP_SIZE, 1, 1));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("string_zfill_sizes failed: Metal command buffer error"));
+    }
+
+    let new_offsets_buf = device.new_buffer((n as usize + 1) as u64 * 8, MTLResourceOptions::StorageModeShared);
+    let mut total_chars: i64 = 0;
+    unsafe {
+        let sizes_ptr = sizes_buf.contents() as *const i64;
+        let offsets_ptr = new_offsets_buf.contents() as *mut i64;
+        for i in 0..n as usize {
+            *offsets_ptr.add(i) = total_chars;
+            total_chars += *sizes_ptr.add(i);
+        }
+        *offsets_ptr.add(n as usize) = total_chars;
+    }
+
+    let new_chars_buf = device.new_buffer(total_chars.max(1) as u64, MTLResourceOptions::StorageModeShared);
+    let write_pl = get_pipeline_state(device, &library, "string_zfill_write")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb2 = queue.new_command_buffer();
+    let enc2 = cb2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&write_pl);
+    enc2.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc2.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&new_offsets_buf), 0);
+    enc2.set_buffer(3, Some(&new_chars_buf), 0);
+    enc2.set_buffer(4, Some(&len_buf), 0);
+    enc2.set_buffer(5, Some(&width_buf), 0);
+    enc2.dispatch_thread_groups(MTLSize::new(num_groups, 1, 1), MTLSize::new(THREADGROUP_SIZE, 1, 1));
+    enc2.end_encoding();
+    cb2.commit();
+    cb2.wait_until_completed();
+    if cb2.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("string_zfill_write failed: Metal command buffer error"));
+    }
+
+    let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n as usize + 1, DType::Int64);
+    let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
+}
+
+/// Shared two-pass dispatch for `removeprefix`/`removesuffix`, distinguished
+/// by `direction` (0=prefix, 1=suffix). The affix is uploaded via
+/// `build_scalar_string_buffers`, mirroring how pattern/replacement strings
+/// are passed to the strip/replace kernels above.
+fn dispatch_string_remove_affix(
+    series: &MetalSeries,
+    affix: &str,
+    direction: u32,
+) -> PyResult<MetalSeries> {
+    let (offsets, chars) = series.as_str_checked()?;
+    let (device, queue) = MetalBackend::device_and_queue()?;
+    let library = load_strings_library(device)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    let n = series.len as u64;
+    let (pat_offsets_buf, pat_chars_buf) = build_scalar_string_buffers(device, affix);
+    let dir_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(dir_buf.contents() as *mut u32) = direction; }
+
+    let sizes_buf = device.new_buffer(n * 8, MTLResourceOptions::StorageModeShared);
+    let len_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    unsafe { *(len_buf.contents() as *mut u32) = n as u32; }
+
+    let sizes_pl = get_pipeline_state(device, &library, "string_remove_affix_sizes")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&sizes_pl);
+    enc.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc.set_buffer(2, Some(&pat_offsets_buf), 0);
+    enc.set_buffer(3, Some(&pat_chars_buf), 0);
+    enc.set_buffer(4, Some(&sizes_buf), 0);
+    enc.set_buffer(5, Some(&len_buf), 0);
+    enc.set_buffer(6, Some(&dir_buf), 0);
+    let num_groups = (n + THREADGROUP_SIZE - 1) / THREADGROUP_SIZE;
+    enc.dispatch_thread_groups(MTLSize::new(num_groups, 1, 1), MTLSize::new(THREADGROUP_SIZE, 1, 1));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    if cb.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("string_remove_affix_sizes failed: Metal command buffer error"));
+    }
+
+    let new_offsets_buf = device.new_buffer((n as usize + 1) as u64 * 8, MTLResourceOptions::StorageModeShared);
+    let mut total_chars: i64 = 0;
+    unsafe {
+        let sizes_ptr = sizes_buf.contents() as *const i64;
+        let offsets_ptr = new_offsets_buf.contents() as *mut i64;
+        for i in 0..n as usize {
+            *offsets_ptr.add(i) = total_chars;
+            total_chars += *sizes_ptr.add(i);
+        }
+        *offsets_ptr.add(n as usize) = total_chars;
+    }
+
+    let new_chars_buf = device.new_buffer(total_chars.max(1) as u64, MTLResourceOptions::StorageModeShared);
+    let write_pl = get_pipeline_state(device, &library, "string_remove_affix_write")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let cb2 = queue.new_command_buffer();
+    let enc2 = cb2.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&write_pl);
+    enc2.set_buffer(0, Some(offsets.metal_buffer()), 0);
+    enc2.set_buffer(1, Some(chars.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&pat_offsets_buf), 0);
+    enc2.set_buffer(3, Some(&pat_chars_buf), 0);
+    enc2.set_buffer(4, Some(&new_offsets_buf), 0);
+    enc2.set_buffer(5, Some(&new_chars_buf), 0);
+    enc2.set_buffer(6, Some(&len_buf), 0);
+    enc2.set_buffer(7, Some(&dir_buf), 0);
+    enc2.dispatch_thread_groups(MTLSize::new(num_groups, 1, 1), MTLSize::new(THREADGROUP_SIZE, 1, 1));
+    enc2.end_encoding();
+    cb2.commit();
+    cb2.wait_until_completed();
+    if cb2.status() == metal::MTLCommandBufferStatus::Error {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("string_remove_affix_write failed: Metal command buffer error"));
+    }
+
+    let new_offsets = SharedBuffer::from_metal_buffer(new_offsets_buf, n as usize + 1, DType::Int64);
+    let new_chars = SharedBuffer::from_metal_buffer(new_chars_buf, total_chars as usize, DType::Uint8);
+    Ok(MetalSeries::from_str_parts(device, new_offsets, new_chars, series.len))
+}
+
+#[pyfunction]
+pub fn metal_string_removeprefix(series: &MetalSeries, prefix: &str) -> PyResult<MetalSeries> {
+    dispatch_string_remove_affix(series, prefix, 0)
+}
+
+#[pyfunction]
+pub fn metal_string_removesuffix(series: &MetalSeries, suffix: &str) -> PyResult<MetalSeries> {
+    dispatch_string_remove_affix(series, suffix, 1)
 }
 
 // ---------------------------------------------------------------------------

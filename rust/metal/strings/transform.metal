@@ -53,8 +53,8 @@ kernel void string_strip_sizes(
     int64_t end = offsets_in[tid + 1];
     int64_t s = start;
     int64_t e = end;
-    while (s < e && (chars_in[s] == ' ' || chars_in[s] == '\t' || chars_in[s] == '\n' || chars_in[s] == '\r')) s++;
-    while (e > s && (chars_in[e-1] == ' ' || chars_in[e-1] == '\t' || chars_in[e-1] == '\n' || chars_in[e-1] == '\r')) e--;
+    while (s < e && (chars_in[s] == ' ' || chars_in[s] == '\t' || chars_in[s] == '\n' || chars_in[s] == '\r' || chars_in[s] == 0x0B || chars_in[s] == 0x0C)) s++;
+    while (e > s && (chars_in[e-1] == ' ' || chars_in[e-1] == '\t' || chars_in[e-1] == '\n' || chars_in[e-1] == '\r' || chars_in[e-1] == 0x0B || chars_in[e-1] == 0x0C)) e--;
     sizes[tid] = e - s;
 }
 
@@ -73,8 +73,8 @@ kernel void string_strip_write(
     int64_t end = offsets_in[tid + 1];
     int64_t s = start;
     int64_t e = end;
-    while (s < e && (chars_in[s] == ' ' || chars_in[s] == '\t' || chars_in[s] == '\n' || chars_in[s] == '\r')) s++;
-    while (e > s && (chars_in[e-1] == ' ' || chars_in[e-1] == '\t' || chars_in[e-1] == '\n' || chars_in[e-1] == '\r')) e--;
+    while (s < e && (chars_in[s] == ' ' || chars_in[s] == '\t' || chars_in[s] == '\n' || chars_in[s] == '\r' || chars_in[s] == 0x0B || chars_in[s] == 0x0C)) s++;
+    while (e > s && (chars_in[e-1] == ' ' || chars_in[e-1] == '\t' || chars_in[e-1] == '\n' || chars_in[e-1] == '\r' || chars_in[e-1] == 0x0B || chars_in[e-1] == 0x0C)) e--;
     int64_t out_start = offsets_out[tid];
     for (int64_t i = s; i < e; i++) {
         chars_out[out_start + (i - s)] = chars_in[i];
@@ -163,4 +163,151 @@ kernel void string_replace_write(
         }
     }
     while (i < s.len) chars_out[out_pos++] = s.data[i++];
+}
+
+// --- swapcase: same-length output (1:1 byte mapping for ASCII) ---
+
+kernel void string_swapcase(
+    device const int64_t* offsets_in  [[buffer(0)]],
+    device const uchar*   chars_in   [[buffer(1)]],
+    device uchar*         chars_out  [[buffer(2)]],
+    device const uint*    len_ptr    [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint n = *len_ptr;
+    if (tid >= n) return;
+    int64_t start = offsets_in[tid];
+    int64_t end = offsets_in[tid + 1];
+    for (int64_t i = start; i < end; i++) {
+        uchar c = chars_in[i];
+        if (c >= 0x41 && c <= 0x5A)      chars_out[i] = c + 32;
+        else if (c >= 0x61 && c <= 0x7A) chars_out[i] = c - 32;
+        else                              chars_out[i] = c;
+    }
+}
+
+// --- title: same-length output, uppercase after word boundary ---
+
+kernel void string_title(
+    device const int64_t* offsets_in  [[buffer(0)]],
+    device const uchar*   chars_in   [[buffer(1)]],
+    device uchar*         chars_out  [[buffer(2)]],
+    device const uint*    len_ptr    [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint n = *len_ptr;
+    if (tid >= n) return;
+    int64_t start = offsets_in[tid];
+    int64_t end = offsets_in[tid + 1];
+    bool after_boundary = true;
+    for (int64_t i = start; i < end; i++) {
+        uchar c = chars_in[i];
+        bool is_alpha = (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A);
+        if (is_alpha && after_boundary)
+            chars_out[i] = (c >= 0x61) ? c - 32 : c;
+        else if (is_alpha)
+            chars_out[i] = (c <= 0x5A) ? c + 32 : c;
+        else
+            chars_out[i] = c;
+        after_boundary = !is_alpha;
+    }
+}
+
+// --- capitalize: uppercase first char, lowercase rest ---
+
+kernel void string_capitalize(
+    device const int64_t* offsets_in  [[buffer(0)]],
+    device const uchar*   chars_in   [[buffer(1)]],
+    device uchar*         chars_out  [[buffer(2)]],
+    device const uint*    len_ptr    [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint n = *len_ptr;
+    if (tid >= n) return;
+    int64_t start = offsets_in[tid];
+    int64_t end = offsets_in[tid + 1];
+    for (int64_t i = start; i < end; i++) {
+        uchar c = chars_in[i];
+        if (i == start) {
+            chars_out[i] = (c >= 0x61 && c <= 0x7A) ? (c - 32) : c;
+        } else {
+            chars_out[i] = (c >= 0x41 && c <= 0x5A) ? (c + 32) : c;
+        }
+    }
+}
+
+// --- lstrip: variable-length output (two-pass), trim leading whitespace only ---
+
+kernel void string_lstrip_sizes(
+    device const int64_t* offsets_in  [[buffer(0)]],
+    device const uchar*   chars_in   [[buffer(1)]],
+    device int64_t*       sizes      [[buffer(2)]],
+    device const uint*    len_ptr    [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint n = *len_ptr;
+    if (tid >= n) return;
+    int64_t start = offsets_in[tid];
+    int64_t end = offsets_in[tid + 1];
+    int64_t s = start;
+    while (s < end && (chars_in[s] == ' ' || chars_in[s] == '\t' || chars_in[s] == '\n' || chars_in[s] == '\r' || chars_in[s] == 0x0B || chars_in[s] == 0x0C)) s++;
+    sizes[tid] = end - s;
+}
+
+kernel void string_lstrip_write(
+    device const int64_t* offsets_in  [[buffer(0)]],
+    device const uchar*   chars_in   [[buffer(1)]],
+    device const int64_t* offsets_out [[buffer(2)]],
+    device uchar*         chars_out  [[buffer(3)]],
+    device const uint*    len_ptr    [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint n = *len_ptr;
+    if (tid >= n) return;
+    int64_t start = offsets_in[tid];
+    int64_t end = offsets_in[tid + 1];
+    int64_t s = start;
+    while (s < end && (chars_in[s] == ' ' || chars_in[s] == '\t' || chars_in[s] == '\n' || chars_in[s] == '\r' || chars_in[s] == 0x0B || chars_in[s] == 0x0C)) s++;
+    int64_t out_start = offsets_out[tid];
+    for (int64_t i = s; i < end; i++) {
+        chars_out[out_start + (i - s)] = chars_in[i];
+    }
+}
+
+// --- rstrip: variable-length output (two-pass), trim trailing whitespace only ---
+
+kernel void string_rstrip_sizes(
+    device const int64_t* offsets_in  [[buffer(0)]],
+    device const uchar*   chars_in   [[buffer(1)]],
+    device int64_t*       sizes      [[buffer(2)]],
+    device const uint*    len_ptr    [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint n = *len_ptr;
+    if (tid >= n) return;
+    int64_t start = offsets_in[tid];
+    int64_t end = offsets_in[tid + 1];
+    int64_t e = end;
+    while (e > start && (chars_in[e-1] == ' ' || chars_in[e-1] == '\t' || chars_in[e-1] == '\n' || chars_in[e-1] == '\r' || chars_in[e-1] == 0x0B || chars_in[e-1] == 0x0C)) e--;
+    sizes[tid] = e - start;
+}
+
+kernel void string_rstrip_write(
+    device const int64_t* offsets_in  [[buffer(0)]],
+    device const uchar*   chars_in   [[buffer(1)]],
+    device const int64_t* offsets_out [[buffer(2)]],
+    device uchar*         chars_out  [[buffer(3)]],
+    device const uint*    len_ptr    [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint n = *len_ptr;
+    if (tid >= n) return;
+    int64_t start = offsets_in[tid];
+    int64_t end = offsets_in[tid + 1];
+    int64_t e = end;
+    while (e > start && (chars_in[e-1] == ' ' || chars_in[e-1] == '\t' || chars_in[e-1] == '\n' || chars_in[e-1] == '\r' || chars_in[e-1] == 0x0B || chars_in[e-1] == 0x0C)) e--;
+    int64_t out_start = offsets_out[tid];
+    for (int64_t i = start; i < e; i++) {
+        chars_out[out_start + (i - start)] = chars_in[i];
+    }
 }

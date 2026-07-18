@@ -49,3 +49,57 @@ def test_replace_pattern_longer_than_string():
     s = metaldf_engine.MetalSeries.from_strings(["ab", "cd", "longer than pattern"])
     result = metaldf_engine.metal_string_replace(s, "xyzzy", "Q")
     assert result.to_strings() == ["ab", "cd", "longer than pattern"]
+
+
+def test_swapcase():
+    s = metaldf_engine.MetalSeries.from_strings(["Hello", "WORLD", "foo123"])
+    result = metaldf_engine.metal_string_swapcase(s)
+    assert result.to_strings() == ["hELLO", "world", "FOO123"]
+
+
+def test_title():
+    s = metaldf_engine.MetalSeries.from_strings(["hello world", "fOO BAR", "123abc"])
+    result = metaldf_engine.metal_string_title(s)
+    assert result.to_strings() == ["Hello World", "Foo Bar", "123Abc"]
+
+
+def test_title_single_word():
+    s = metaldf_engine.MetalSeries.from_strings(["hello", "HELLO", ""])
+    result = metaldf_engine.metal_string_title(s)
+    assert result.to_strings() == ["Hello", "Hello", ""]
+
+
+def test_capitalize():
+    s = metaldf_engine.MetalSeries.from_strings(["hello world", "HELLO", "fOO", ""])
+    result = metaldf_engine.metal_string_capitalize(s)
+    assert result.to_strings() == ["Hello world", "Hello", "Foo", ""]
+
+
+def test_casefold():
+    s = metaldf_engine.MetalSeries.from_strings(["Hello", "WORLD", "FoO123"])
+    result = metaldf_engine.metal_string_casefold(s)
+    assert result.to_strings() == ["hello", "world", "foo123"]
+
+
+def test_lstrip():
+    s = metaldf_engine.MetalSeries.from_strings(["  hello  ", "\tworld\n", "  foo"])
+    result = metaldf_engine.metal_string_lstrip(s)
+    assert result.to_strings() == ["hello  ", "world\n", "foo"]
+
+
+def test_lstrip_empty():
+    s = metaldf_engine.MetalSeries.from_strings(["   ", "", "  a  "])
+    result = metaldf_engine.metal_string_lstrip(s)
+    assert result.to_strings() == ["", "", "a  "]
+
+
+def test_rstrip():
+    s = metaldf_engine.MetalSeries.from_strings(["  hello  ", "\tworld\n", "foo  "])
+    result = metaldf_engine.metal_string_rstrip(s)
+    assert result.to_strings() == ["  hello", "\tworld", "foo"]
+
+
+def test_rstrip_empty():
+    s = metaldf_engine.MetalSeries.from_strings(["   ", "", "  a  "])
+    result = metaldf_engine.metal_string_rstrip(s)
+    assert result.to_strings() == ["", "", "  a"]

@@ -23,7 +23,15 @@ use kernels::strings::{
     metal_string_le, metal_string_ge, metal_string_eq_scalar,
     metal_string_contains, metal_string_startswith, metal_string_endswith, metal_string_find,
     metal_string_lower, metal_string_upper, metal_string_strip, metal_string_replace,
+    metal_string_lstrip, metal_string_rstrip,
+    metal_string_swapcase, metal_string_title, metal_string_capitalize, metal_string_casefold,
     metal_string_sort, metal_string_groupby,
+    metal_string_len, metal_string_count,
+    metal_string_isalpha, metal_string_isdigit, metal_string_isspace,
+    metal_string_isalnum, metal_string_isupper, metal_string_islower,
+    metal_string_istitle, metal_string_isnumeric, metal_string_isdecimal,
+    metal_string_slice, metal_string_get, metal_string_repeat,
+    metal_string_pad, metal_string_zfill, metal_string_removeprefix, metal_string_removesuffix,
 };
 use kernels::expression::{eval_expression, eval_expression_reduce};
 use kernels::codegen::{eval_expression_codegen, eval_multi_expression_codegen};
@@ -116,9 +124,33 @@ fn metaldf_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(metal_string_lower))?;
     m.add_wrapped(wrap_pyfunction!(metal_string_upper))?;
     m.add_wrapped(wrap_pyfunction!(metal_string_strip))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_lstrip))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_rstrip))?;
     m.add_wrapped(wrap_pyfunction!(metal_string_replace))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_swapcase))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_title))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_capitalize))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_casefold))?;
     m.add_wrapped(wrap_pyfunction!(metal_string_sort))?;
     m.add_wrapped(wrap_pyfunction!(metal_string_groupby))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_len))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_count))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_isalpha))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_isdigit))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_isspace))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_isalnum))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_isupper))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_islower))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_istitle))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_isnumeric))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_isdecimal))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_slice))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_get))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_repeat))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_pad))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_zfill))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_removeprefix))?;
+    m.add_wrapped(wrap_pyfunction!(metal_string_removesuffix))?;
     m.add_wrapped(wrap_pyfunction!(eval_expression))?;
     m.add_wrapped(wrap_pyfunction!(eval_expression_reduce))?;
     m.add_wrapped(wrap_pyfunction!(eval_expression_codegen))?;

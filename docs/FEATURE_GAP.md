@@ -36,11 +36,11 @@ Last updated: 2026-07-15
 | Rolling: NaN-aware skip | None | Full | Missing |
 | Expanding window | None | Full | Missing |
 | EWM (exponentially weighted) | None | Full | Missing |
-| String: contains/startswith/endswith/find | Literal only | Full (+ regex) | Partial |
-| String: lower/upper/strip/replace | Literal replace only | Full (+ regex replace) | Partial |
-| String: extract/split/pad/center | None | Full | Missing |
-| String: len/count/repeat/slice | None | Full | Missing |
-| String: isalpha/isdigit/isspace/etc | None | Full | Missing |
+| String: contains/startswith/endswith/find | Full (literal) | Full (+ regex) | Partial |
+| String: lower/upper/strip/replace/swapcase/title/capitalize/casefold/lstrip/rstrip | Full (literal, ASCII) | Full (+ regex replace) | Partial |
+| String: len/count/repeat/slice/get/pad/center/ljust/rjust/zfill/removeprefix/removesuffix | Full (literal, ASCII) | Full | Done |
+| String: isalpha/isdigit/isspace/isalnum/isupper/islower/istitle/isnumeric/isdecimal | Full (ASCII) | Full | Done |
+| String: extract/split/cat/join/partition (regex/list-column output) | None | Full | Missing |
 | Datetime: year/month/day/hour/min/sec/dow | Done | Full | Done |
 | Datetime: quarter/dayofyear | Done | Full | Done |
 | Datetime: is_month_start/end/leap_year | None | Full | Missing |
@@ -152,6 +152,6 @@ Last updated: 2026-07-15
 | | P16 | describe() | Small | Low | P3 |
 | | P17 | corr/cov | Medium | Low | P3 |
 | | P18 | EWM / expanding windows | Medium | Low | None |
-| | P19 | String: len/count/split/extract/pad | Medium | Medium | None |
+| :white_check_mark: | P19 | String: len/count/split/extract/pad (non-regex subset done) | Medium | Medium | None |
 | :white_check_mark: | P20 | Datetime: quarter/dayofyear (strftime/round still missing) | Small | Low | None |
 

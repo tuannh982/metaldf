@@ -1127,7 +1127,19 @@ class ProxyStringAccessor:
     # Ops whose Rust kernel returns an Int32 0/1 MetalSeries (cast to bool)
     # vs. a Utf8 MetalSeries (materialized back to Python strings).
     _BOOL_OPS = ("contains", "startswith", "endswith")
-    _TRANSFORM_OPS = ("lower", "upper", "strip")
+    _TRANSFORM_OPS = (
+        "lower", "upper", "strip", "swapcase", "title",
+        "capitalize", "casefold", "lstrip", "rstrip",
+    )
+    # Classification ops whose Rust kernel returns an Int32 0/1 MetalSeries
+    # (cast to bool), same shape as _BOOL_OPS but with no pattern argument.
+    _CLASSIFY_OPS = (
+        "isalpha", "isdigit", "isspace", "isalnum",
+        "isupper", "islower", "istitle", "isnumeric", "isdecimal",
+    )
+    # Ops whose Rust kernel returns an integer-valued MetalSeries materialized
+    # as-is (no bool cast, no string round-trip).
+    _INT_OPS = ("len",)
 
     def _metal_series_and_module(self) -> tuple[Any, Any]:
         """Return ``(cached MetalSeries, metaldf_engine module)`` for this series.
@@ -1182,6 +1194,46 @@ class ProxyStringAccessor:
             elif op_name in self._TRANSFORM_OPS:
                 rust_fn = getattr(metaldf_engine, f"metal_string_{op_name}")
                 result = rust_fn(metal_series)
+                pandas_result = pd.Series(result.to_strings(), index=index, name=name)
+            elif op_name in self._CLASSIFY_OPS:
+                rust_fn = getattr(metaldf_engine, f"metal_string_{op_name}")
+                result = rust_fn(metal_series)
+                pandas_result = pd.Series(result.to_numpy().astype(bool), index=index, name=name)
+            elif op_name in self._INT_OPS:
+                rust_fn = getattr(metaldf_engine, f"metal_string_{op_name}")
+                result = rust_fn(metal_series)
+                pandas_result = pd.Series(result.to_numpy(), index=index, name=name)
+            elif op_name == "count":
+                result = metaldf_engine.metal_string_count(metal_series, args[0])
+                pandas_result = pd.Series(result.to_numpy(), index=index, name=name)
+            elif op_name == "slice":
+                result = metaldf_engine.metal_string_slice(metal_series, args[0], args[1])
+                pandas_result = pd.Series(result.to_strings(), index=index, name=name)
+            elif op_name == "get":
+                # The kernel returns "" for an out-of-range index (see
+                # rust/src/kernels/strings.rs::metal_string_get and its
+                # `test_get_out_of_bounds`); a valid access always yields
+                # exactly one character, so "" unambiguously means
+                # out-of-range. pandas' `.str.get` gives NaN in that case,
+                # so translate "" -> None (pandas infers the missing marker)
+                # to match.
+                result = metaldf_engine.metal_string_get(metal_series, args[0])
+                strs = [v if v != "" else None for v in result.to_strings()]
+                pandas_result = pd.Series(strs, index=index, name=name)
+            elif op_name == "repeat":
+                result = metaldf_engine.metal_string_repeat(metal_series, args[0])
+                pandas_result = pd.Series(result.to_strings(), index=index, name=name)
+            elif op_name == "pad":
+                result = metaldf_engine.metal_string_pad(metal_series, args[0], args[1], args[2])
+                pandas_result = pd.Series(result.to_strings(), index=index, name=name)
+            elif op_name == "zfill":
+                result = metaldf_engine.metal_string_zfill(metal_series, args[0])
+                pandas_result = pd.Series(result.to_strings(), index=index, name=name)
+            elif op_name == "removeprefix":
+                result = metaldf_engine.metal_string_removeprefix(metal_series, args[0])
+                pandas_result = pd.Series(result.to_strings(), index=index, name=name)
+            elif op_name == "removesuffix":
+                result = metaldf_engine.metal_string_removesuffix(metal_series, args[0])
                 pandas_result = pd.Series(result.to_strings(), index=index, name=name)
             else:
                 raise MetalNotAvailable(f"Unsupported string op for Metal dispatch: {op_name}")
@@ -1270,6 +1322,204 @@ class ProxyStringAccessor:
 
     def strip(self) -> Any:
         return self._try_metal("strip")
+
+    def swapcase(self) -> Any:
+        return self._try_metal("swapcase")
+
+    def title(self) -> Any:
+        return self._try_metal("title")
+
+    def capitalize(self) -> Any:
+        return self._try_metal("capitalize")
+
+    def casefold(self) -> Any:
+        return self._try_metal("casefold")
+
+    def lstrip(self, to_strip: Any = None, **kwargs: Any) -> Any:
+        # The Metal kernel only strips ASCII whitespace -- if the caller
+        # passes custom characters to strip, fall back to pandas rather
+        # than silently ignoring `to_strip`.
+        if to_strip is not None or kwargs:
+            return self._fallback("lstrip", to_strip, **kwargs)
+        return self._try_metal("lstrip")
+
+    def rstrip(self, to_strip: Any = None, **kwargs: Any) -> Any:
+        if to_strip is not None or kwargs:
+            return self._fallback("rstrip", to_strip, **kwargs)
+        return self._try_metal("rstrip")
+
+    def len(self) -> Any:
+        return self._try_metal("len")
+
+    def count(self, pat: str, **kwargs: Any) -> Any:
+        # pandas' `count` treats `pat` as a regex by default and accepts
+        # `flags=`; the Metal kernel only does literal substring counting,
+        # so any kwargs (which imply non-default regex semantics) fall
+        # back to pandas rather than silently reinterpreting `pat`.
+        if kwargs:
+            return self._fallback("count", pat, **kwargs)
+        return self._try_metal("count", pat)
+
+    def isalpha(self) -> Any:
+        return self._try_metal("isalpha")
+
+    def isdigit(self) -> Any:
+        return self._try_metal("isdigit")
+
+    def isspace(self) -> Any:
+        return self._try_metal("isspace")
+
+    def isalnum(self) -> Any:
+        return self._try_metal("isalnum")
+
+    def isupper(self) -> Any:
+        return self._try_metal("isupper")
+
+    def islower(self) -> Any:
+        return self._try_metal("islower")
+
+    def istitle(self) -> Any:
+        return self._try_metal("istitle")
+
+    def isnumeric(self) -> Any:
+        return self._try_metal("isnumeric")
+
+    def isdecimal(self) -> Any:
+        return self._try_metal("isdecimal")
+
+    def slice(self, start: int = None, stop: int = None, step: int = None, **kwargs: Any) -> Any:
+        # The Metal kernel only supports a plain [start:stop] slice -- a
+        # step changes which characters are picked (not just the bounds),
+        # which the kernel doesn't replicate, so fall back to pandas.
+        if step is not None or kwargs:
+            return self._fallback("slice", start=start, stop=stop, step=step, **kwargs)
+        s = start if start is not None else 0
+        e = stop if stop is not None else 2**31 - 1
+        return self._try_metal("slice", s, e)
+
+    def get(self, i: int, **kwargs: Any) -> Any:
+        if kwargs:
+            return self._fallback("get", i, **kwargs)
+        return self._try_metal("get", i)
+
+    def repeat(self, repeats: int, **kwargs: Any) -> Any:
+        if kwargs:
+            return self._fallback("repeat", repeats, **kwargs)
+        return self._try_metal("repeat", repeats)
+
+    def pad(self, width: int, side: str = "left", fillchar: str = " ", **kwargs: Any) -> Any:
+        """Pad strings to `width`, trying Metal for a single-char ASCII fillchar.
+
+        Doesn't reuse the generic ``_try_metal`` helper here: on a genuine
+        Metal failure, ``_try_metal``'s fallback calls ``getattr(accessor,
+        op_name)(*args, **kwargs)`` -- but by that point ``args`` are
+        already the *converted* ints (``side_map[side]``, ``ord(fillchar)``),
+        not the original ``side``/``fillchar`` strings pandas' ``pad``
+        expects, so the fallback call itself would raise. Falling back
+        explicitly with the original string arguments (like ``replace()``
+        already does) avoids that.
+
+        Also guards ``fillchar`` to a single ASCII character (``< 128``)
+        before dispatching to Metal: ``ord(fillchar)`` gets truncated to a
+        ``uchar`` in MSL, so a non-ASCII fillchar would silently produce a
+        wrong (truncated) fill character instead of erroring -- fall back
+        to pandas instead of risking silent corruption.
+        """
+        if kwargs:
+            return self._fallback("pad", width, side=side, fillchar=fillchar, **kwargs)
+        side_map = {"left": 0, "right": 1, "both": 2}
+        if side not in side_map:
+            return self._fallback("pad", width, side=side, fillchar=fillchar)
+        if len(fillchar) != 1 or ord(fillchar) >= 128:
+            return self._fallback("pad", width, side=side, fillchar=fillchar)
+        from metaldf.exceptions import MetalNotAvailable
+        try:
+            metal_series, metaldf_engine = self._metal_series_and_module()
+            pandas_obj = self._series._pandas_obj
+            result = metaldf_engine.metal_string_pad(metal_series, width, side_map[side], ord(fillchar))
+            pandas_result = pd.Series(result.to_strings(), index=pandas_obj.index, name=pandas_obj.name)
+            return _wrap_result(pandas_result)
+        except (MetalNotAvailable, Exception):
+            return self._fallback("pad", width, side=side, fillchar=fillchar)
+
+    def center(self, width: int, fillchar: str = " ", **kwargs: Any) -> Any:
+        """Center-pad strings to `width`. See ``pad``'s docstring for why this
+        has its own try/except instead of going through ``_try_metal``."""
+        if kwargs:
+            return self._fallback("center", width, fillchar=fillchar, **kwargs)
+        if len(fillchar) != 1 or ord(fillchar) >= 128:
+            return self._fallback("center", width, fillchar=fillchar)
+        from metaldf.exceptions import MetalNotAvailable
+        try:
+            metal_series, metaldf_engine = self._metal_series_and_module()
+            pandas_obj = self._series._pandas_obj
+            result = metaldf_engine.metal_string_pad(metal_series, width, 2, ord(fillchar))
+            pandas_result = pd.Series(result.to_strings(), index=pandas_obj.index, name=pandas_obj.name)
+            return _wrap_result(pandas_result)
+        except (MetalNotAvailable, Exception):
+            return self._fallback("center", width, fillchar=fillchar)
+
+    def ljust(self, width: int, fillchar: str = " ", **kwargs: Any) -> Any:
+        """Left-justify (pad on the right) to `width`. See ``pad``'s docstring
+        for why this has its own try/except instead of going through
+        ``_try_metal``."""
+        if kwargs:
+            return self._fallback("ljust", width, fillchar=fillchar, **kwargs)
+        if len(fillchar) != 1 or ord(fillchar) >= 128:
+            return self._fallback("ljust", width, fillchar=fillchar)
+        from metaldf.exceptions import MetalNotAvailable
+        try:
+            metal_series, metaldf_engine = self._metal_series_and_module()
+            pandas_obj = self._series._pandas_obj
+            result = metaldf_engine.metal_string_pad(metal_series, width, 1, ord(fillchar))
+            pandas_result = pd.Series(result.to_strings(), index=pandas_obj.index, name=pandas_obj.name)
+            return _wrap_result(pandas_result)
+        except (MetalNotAvailable, Exception):
+            return self._fallback("ljust", width, fillchar=fillchar)
+
+    def rjust(self, width: int, fillchar: str = " ", **kwargs: Any) -> Any:
+        """Right-justify (pad on the left) to `width`. See ``pad``'s docstring
+        for why this has its own try/except instead of going through
+        ``_try_metal``."""
+        if kwargs:
+            return self._fallback("rjust", width, fillchar=fillchar, **kwargs)
+        if len(fillchar) != 1 or ord(fillchar) >= 128:
+            return self._fallback("rjust", width, fillchar=fillchar)
+        from metaldf.exceptions import MetalNotAvailable
+        try:
+            metal_series, metaldf_engine = self._metal_series_and_module()
+            pandas_obj = self._series._pandas_obj
+            result = metaldf_engine.metal_string_pad(metal_series, width, 0, ord(fillchar))
+            pandas_result = pd.Series(result.to_strings(), index=pandas_obj.index, name=pandas_obj.name)
+            return _wrap_result(pandas_result)
+        except (MetalNotAvailable, Exception):
+            return self._fallback("rjust", width, fillchar=fillchar)
+
+    def zfill(self, width: int, **kwargs: Any) -> Any:
+        """Zero-pad strings to `width`. Given its own try/except (rather than
+        going through ``_try_metal``) for consistency with the rest of the
+        pad family, even though ``zfill`` takes no ``fillchar`` argument."""
+        if kwargs:
+            return self._fallback("zfill", width, **kwargs)
+        from metaldf.exceptions import MetalNotAvailable
+        try:
+            metal_series, metaldf_engine = self._metal_series_and_module()
+            pandas_obj = self._series._pandas_obj
+            result = metaldf_engine.metal_string_zfill(metal_series, width)
+            pandas_result = pd.Series(result.to_strings(), index=pandas_obj.index, name=pandas_obj.name)
+            return _wrap_result(pandas_result)
+        except (MetalNotAvailable, Exception):
+            return self._fallback("zfill", width)
+
+    def removeprefix(self, prefix: str, **kwargs: Any) -> Any:
+        if kwargs:
+            return self._fallback("removeprefix", prefix, **kwargs)
+        return self._try_metal("removeprefix", prefix)
+
+    def removesuffix(self, suffix: str, **kwargs: Any) -> Any:
+        if kwargs:
+            return self._fallback("removesuffix", suffix, **kwargs)
+        return self._try_metal("removesuffix", suffix)
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._real_str_accessor(), name)
